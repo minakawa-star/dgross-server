@@ -12,6 +12,7 @@ import io
 import json
 import os
 import traceback
+import zipfile
 from datetime import date, timedelta
 
 import pandas as pd
@@ -69,13 +70,17 @@ def update():
             return jsonify({'error': '生産性レポートが見つかりません'}), 400
         if 'work' not in request.files:
             return jsonify({'error': '勤務データが見つかりません'}), 400
+        if 'report' not in request.files:
+            return jsonify({'error': 'レポートが見つかりません'}), 400
         # スタッフマスター：アップロードされていればそちらを優先、なければGitHubから取得
         if 'prev' not in request.files:
             return jsonify({'error': '前回のpt_data.jsonが見つかりません'}), 400
 
         apo_file    = request.files['apo'].read()
         prod_file   = request.files['prod'].read()
-        work_file   = request.files['work'].read()
+        # 勤務データ：zipの場合は中のcsvを取り出す
+        work_raw = request.files['work'].read()
+        work_file = _extract_work_from_zip(work_raw)
         master_file = (request.files['master'].read()
                        if 'master' in request.files
                        else get_master_from_github())
@@ -231,6 +236,22 @@ def update():
 # ============================================================
 # ヘルパー関数
 # ============================================================
+def _extract_work_from_zip(file_bytes):
+    """zip圧縮の勤務データを展開してcsvバイトを返す。csvの場合はそのまま返す"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            # csvファイルを探す
+            csv_files = [n for n in zf.namelist() if n.lower().endswith('.csv')]
+            if not csv_files:
+                raise ValueError('zip内にcsvファイルが見つかりません')
+            # 最初のcsvを使用（複数あれば最大サイズのものを使用）
+            target = max(csv_files, key=lambda n: zf.getinfo(n).file_size)
+            return zf.read(target)
+    except zipfile.BadZipFile:
+        # zipではなくcsvの場合はそのまま返す
+        return file_bytes
+
+
 def _load_master(file_bytes):
     wb = load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws_m = wb['スタッフマスター']
