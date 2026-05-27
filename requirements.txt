@@ -3,3 +3,4 @@ flask-cors==4.0.1
 pandas
 openpyxl
 gunicorn==22.0.0
+requests
