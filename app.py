@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PT事業部 ダッシュボード更新サーバー
-====================================
+PT事業部 ダッシュボード更新サーバー v2
+========================================
+設計方針：
+  毎回アポイントリストから当月分を全て集計し直す（差分加算なし）
+  前回のpt_data.jsonからは「目標・設定値・チャートラベル」のみ参照
+
 エンドポイント：
   POST /update  : 4ファイルを受け取り集計・pt_data.jsonを返す
   GET  /health  : サーバー稼働確認用
@@ -27,10 +31,10 @@ CORS(app)
 # ============================================================
 # 定数
 # ============================================================
-SITE_LABEL    = {'新宿SC': '新宿SC', '在宅G': 'リモートSC', 'AI': 'AI'}
-B_TO_D        = {'B0000106': 'D0000295', 'B0000107': 'D0000326'}
-KONO          = '幸野有希子CRM'
-EXCLUDE_OPS   = ['堀川璃歩']
+SITE_LABEL  = {'新宿SC': '新宿SC', '在宅G': 'リモートSC', 'AI': 'AI'}
+B_TO_D      = {'B0000106': 'D0000295', 'B0000107': 'D0000326'}
+KONO        = '幸野有希子CRM'   # 全体/サイト集計から除外
+EXCLUDE_OPS = ['堀川璃歩']      # 全集計から除外
 
 # GitHubからスタッフマスターを自動読み込み
 MASTER_URL = 'https://raw.githubusercontent.com/minakawa-star/digross-server/main/%E3%82%B9%E3%82%BF%E3%83%83%E3%83%95%E3%83%9E%E3%82%B9%E3%82%BF%E3%83%BC.xlsx'
@@ -64,91 +68,103 @@ def health():
 def update():
     try:
         # --- ファイル受け取り ---
-        if 'apo' not in request.files:
-            return jsonify({'error': 'アポイントリストが見つかりません'}), 400
-        if 'prod' not in request.files:
-            return jsonify({'error': '生産性レポートが見つかりません'}), 400
-        if 'work' not in request.files:
-            return jsonify({'error': '勤務データが見つかりません'}), 400
-        if 'report' not in request.files:
-            return jsonify({'error': 'レポートが見つかりません'}), 400
-        # スタッフマスター：アップロードされていればそちらを優先、なければGitHubから取得
-        if 'prev' not in request.files:
-            return jsonify({'error': '前回のpt_data.jsonが見つかりません'}), 400
+        for key, label in [('apo','アポイントリスト'),('prod','生産性レポート'),
+                            ('work','勤務データ'),('report','レポート')]:
+            if key not in request.files:
+                return jsonify({'error': f'{label}が見つかりません'}), 400
 
-        apo_file    = request.files['apo'].read()
-        prod_file   = request.files['prod'].read()
-        # 勤務データ：zipの場合は中のcsvを取り出す
-        work_raw = request.files['work'].read()
+        apo_file  = request.files['apo'].read()
+        prod_file = request.files['prod'].read()
+        work_raw  = request.files['work'].read()
         work_file = _extract_work_from_zip(work_raw)
+        prev_json = json.loads(request.files['prev'].read().decode('utf-8'))
+
+        # スタッフマスター：アップロード優先、なければGitHubから取得
         master_file = (request.files['master'].read()
                        if 'master' in request.files
                        else get_master_from_github())
-        prev_json   = json.loads(request.files['prev'].read().decode('utf-8'))
-        inc_map     = prev_json.get('incentive', {})
 
-        # インセンティブファイル（任意）
+        # インセンティブ（任意）
+        inc_map = prev_json.get('incentive', {})
         if 'inc' in request.files:
             inc_map = _load_incentive(request.files['inc'].read())
 
         # --- マスター読み込み ---
         df_master, df_wage = _load_master(master_file)
-        site_map  = dict(zip(df_master['スタッフ名'], df_master['サイト']))
-        rank_map  = dict(zip(df_master['スタッフ名'], df_master['ランク']))
-        id_map    = dict(zip(df_master['スタッフ名'], df_master['社員番号']))
+        site_map   = dict(zip(df_master['スタッフ名'], df_master['サイト']))
+        rank_map   = dict(zip(df_master['スタッフ名'], df_master['ランク']))
+        id_map     = dict(zip(df_master['スタッフ名'], df_master['社員番号']))
         master_ids = set(df_master['社員番号'].tolist())
 
-        # --- アポイントリスト ---
+        # --- アポイントリスト読み込み ---
         df_apo = _load_apo(apo_file)
 
-        # --- 生産性レポート ---
+        # --- 生産性レポート読み込み ---
         df_prod = _load_csv(prod_file)
 
-        # --- 勤務データ ---
+        # --- 勤務データ読み込み ---
         df_work = _load_work(work_file)
 
-        # --- 設定値 ---
-        elapsed = prev_json['meta']['elapsedDays']
-        working = prev_json['meta']['workingDays']
+        # --- 設定値（前回pt_dataから引き継ぐもの）---
+        working  = prev_json['meta']['workingDays']   # 当月営業日数
+        targets  = prev_json['targets']               # 目標値
+        chart_labels = prev_json['chart']['labels']   # チャートラベル
 
-        # --- 新規営業日の特定 ---
-        existing_dates = set(
-            row['date']
-            for rows in prev_json['daily'].values()
-            for row in rows
-        )
-        all_dates = set(df_apo['取得日'].dropna().unique())
-        new_dates = sorted(all_dates - existing_dates)
+        # ============================================================
+        # 当月営業日の特定
+        # アポイントリストの取得日から当月（5月）の日付を抽出
+        # ============================================================
+        all_get_dates = sorted(df_apo['取得日'].dropna().unique())
 
-        if not new_dates:
-            return jsonify({'error': '新しい営業日データが見つかりません'}), 400
+        # 当月（前回pt_dataのmonthから年月を取得）
+        month_str = prev_json['meta']['month']  # 例：2026年5月
+        import re
+        m = re.search(r'(\d{4})年(\d+)月', month_str)
+        target_year  = int(m.group(1))
+        target_month = int(m.group(2))
 
-        target_dates = sorted(existing_dates | set(new_dates))
+        # 当月営業日（取得日が当月のもの）
+        biz_dates = sorted([
+            d for d in all_get_dates
+            if str(d).startswith(f'{target_year}/{str(target_month).zfill(2)}')
+        ])
 
-        # --- 人件費計算 ---
+        if not biz_dates:
+            return jsonify({'error': '当月のアポイントデータが見つかりません'}), 400
+
+        elapsed = len(biz_dates)  # 経過営業日数
+
+        # ============================================================
+        # 人件費計算（勤務データから）
+        # ============================================================
         site_labor, work_by_id, labor_by_id = _calc_labor(
             df_work, df_master, df_wage, master_ids, working)
 
-        # --- コール・稼働人数（日次）---
+        # ============================================================
+        # コール・稼働人数（生産性レポートから日次集計）
+        # ============================================================
         calls_by_date = {}
         ops_by_date   = {}
-        for d in new_dates:
+        for d in biz_dates:
             d_prod = d.replace('/', '-')
             mask = df_prod['日付'] == d_prod
             calls_by_date[d] = int(df_prod[mask]['コール数'].sum())
             ops_by_date[d]   = int(len(df_prod[mask]))
 
-        # --- 日次明細追加 ---
-        for date_str in new_dates:
-            elapsed += 1
-            daily = _calc_daily(df_apo, date_str, site_map,
-                                calls_by_date, ops_by_date, elapsed)
+        # ============================================================
+        # 日次明細（当月全営業日を毎回ゼロから作り直す）
+        # ============================================================
+        daily = {'all': [], 'shinjuku': [], 'remote': [], 'ai': []}
+        for i, date_str in enumerate(biz_dates, 1):
+            d = _calc_daily(df_apo, date_str, site_map,
+                            calls_by_date, ops_by_date, i)
             for key in ['all', 'shinjuku', 'remote', 'ai']:
-                prev_json['daily'][key].append(daily[key])
+                daily[key].append(d[key])
 
-        prev_json['meta']['elapsedDays'] = elapsed
-
-        # --- サイト別累計更新 ---
+        # ============================================================
+        # サイト別累計（日次明細から積み上げ）
+        # ============================================================
+        # インセンティブ日割り
         inc_site = {'新宿SC': 0, 'リモートSC': 0, 'AI': 0}
         for name, inc_total in inc_map.items():
             if inc_total <= 0:
@@ -158,8 +174,9 @@ def update():
                 inc_site[site] += round(inc_total / working * elapsed)
         inc_all = sum(inc_site.values())
 
+        sites = {}
         for k in ['all', 'shinjuku', 'remote', 'ai']:
-            rows   = prev_json['daily'][k]
+            rows   = daily[k]
             sales  = sum(r['sales']  for r in rows)
             apo    = sum(r['apo']    for r in rows)
             cancel = sum(r['cancel'] for r in rows)
@@ -179,55 +196,79 @@ def update():
             cost   = round(labor / sales * 100, 1) if sales > 0 else 0
             ar     = round(apo / calls * 100, 2)   if calls > 0 else 0
             last   = rows[-1] if rows else {}
-            unit_last = (round(last['sales'] / last['ops'])
-                         if last and last.get('ops', 0) > 0 else 0)
-            prev_json['sites'][k] = {
+            # 稼働単価：当月累計売上 ÷ 当月累計出勤日数（重み付き平均）
+            all_ops = [op for op in _calc_operators(
+                df_apo, biz_dates, df_master, df_prod,
+                work_by_id, labor_by_id, id_map, site_map, rank_map,
+                inc_map, elapsed, working)
+                if (k == 'all' or op['site'] == site_jp)
+                and op['sales'] > 0 and op.get('days', 0) > 0]
+            ts = sum(o['sales'] for o in all_ops)
+            td = sum(o['days']  for o in all_ops)
+            unit = round(ts / td) if td > 0 else 0
+
+            sites[k] = {
                 'sales': sales, 'apo': apo, 'cancel': cancel, 'valid': valid,
                 'cancelRate': cr, 'labor': labor, 'costRate': cost,
                 'gross': sales - labor, 'ops': last.get('ops', 0),
-                'unit': unit_last, 'calls': calls, 'apoRate': ar,
+                'unit': unit, 'calls': calls, 'apoRate': ar,
             }
 
-        # --- チャート更新 ---
-        chart_labels = prev_json['chart']['labels']
-        chart_data   = [0.0] * len(chart_labels)
-        for row in prev_json['daily']['all']:
-            d_label = row['date'].replace('2026/', '').lstrip('0').replace('/0', '/')
+        # ============================================================
+        # チャートデータ
+        # ============================================================
+        chart_data = [0.0] * len(chart_labels)
+        for row in daily['all']:
+            d_label = row['date'].replace(f'{target_year}/', '').lstrip('0').replace('/0', '/')
             if d_label in chart_labels:
                 idx = chart_labels.index(d_label)
                 chart_data[idx] = round(row['sales'] / 10000, 1)
-        prev_json['chart']['data'] = chart_data
 
-        # --- ヒートマップ更新 ---
-        prev_json['heatmap'] = _calc_heatmap(
-            df_apo, list(target_dates),
-            prev_json['sites']['all']['sales'])
+        # ============================================================
+        # ヒートマップ（当月営業日ベース）
+        # ============================================================
+        heatmap = _calc_heatmap(df_apo, biz_dates, sites['all']['sales'])
 
-        # --- OP個人実績更新 ---
-        prev_calls = prev_json.get('prev_calls', {})
-        prev_json['operators'] = _calc_operators(
-            df_apo, list(target_dates), df_master, df_prod,
+        # ============================================================
+        # OP個人実績（当月営業日ベース・毎回ゼロから計算）
+        # ============================================================
+        operators = _calc_operators(
+            df_apo, biz_dates, df_master, df_prod,
             work_by_id, labor_by_id, id_map, site_map, rank_map,
-            inc_map, elapsed, working, prev_calls)
+            inc_map, elapsed, working)
 
-        # --- メタ更新 ---
+        # ============================================================
+        # PT_DATA組み立て
+        # ============================================================
         today = date.today().strftime('%Y/%m/%d')
-        last_new = new_dates[-1].replace('2026/', '')
-        prev_json['meta']['lastUpdate']      = today
-        prev_json['meta']['lastUpdateLabel'] = \
-            f"{date.today().strftime('%m/%d')}（{last_new}分反映済）"
-        prev_json['meta']['alertText'] = \
-            f"{last_new}のデータを反映済みです（累計{elapsed}営業日）。最終更新: {today}"
+        last_date = biz_dates[-1].replace(f'{target_year}/', '')
+        month_label = f'{target_year}年{target_month}月'
 
-        if 'inc' in request.files:
-            prev_json['incentive'] = inc_map
+        PT_DATA = {
+            'meta': {
+                'month':           month_label,
+                'lastUpdate':      today,
+                'lastUpdateLabel': f"{date.today().strftime('%m/%d')}（{last_date}分反映済）",
+                'elapsedDays':     elapsed,
+                'workingDays':     working,
+                'alertText':       f"{last_date}のデータを反映済みです（累計{elapsed}営業日）。最終更新: {today}",
+            },
+            'targets':   targets,
+            'sites':     sites,
+            'daily':     daily,
+            'chart':     {'labels': chart_labels, 'data': chart_data},
+            'heatmap':   heatmap,
+            'operators': operators,
+            'incentive': inc_map,
+            'prev_calls': {op['name']: op['calls'] for op in operators},
+        }
 
-        # --- 検証 ---
-        j = json.dumps(prev_json, ensure_ascii=False)
-        assert 'NaN'      not in j
-        assert 'Infinity' not in j
+        # 検証
+        j = json.dumps(PT_DATA, ensure_ascii=False)
+        assert 'NaN'      not in j, 'NaN混入'
+        assert 'Infinity' not in j, 'Infinity混入'
 
-        return jsonify({'status': 'ok', 'data': prev_json})
+        return jsonify({'status': 'ok', 'data': PT_DATA})
 
     except Exception as e:
         return jsonify({'error': str(e), 'detail': traceback.format_exc()}), 500
@@ -240,15 +281,12 @@ def _extract_work_from_zip(file_bytes):
     """zip圧縮の勤務データを展開してcsvバイトを返す。csvの場合はそのまま返す"""
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-            # csvファイルを探す
             csv_files = [n for n in zf.namelist() if n.lower().endswith('.csv')]
             if not csv_files:
                 raise ValueError('zip内にcsvファイルが見つかりません')
-            # 最初のcsvを使用（複数あれば最大サイズのものを使用）
             target = max(csv_files, key=lambda n: zf.getinfo(n).file_size)
             return zf.read(target)
     except zipfile.BadZipFile:
-        # zipではなくcsvの場合はそのまま返す
         return file_bytes
 
 
@@ -319,6 +357,7 @@ def _load_incentive(file_bytes):
 
 
 def _calc_labor(df_work, df_master, df_wage, master_ids, working):
+    """人件費計算（勤務データ全期間から）"""
     site_map_id = dict(zip(df_master['社員番号'], df_master['サイト']))
     wage_by_id  = dict(zip(df_wage['社員番号'], df_wage['時給']))
     note_by_id  = dict(zip(df_wage['社員番号'], df_wage['備考']))
@@ -327,6 +366,7 @@ def _calc_labor(df_work, df_master, df_wage, master_ids, working):
     site_labor  = {'新宿SC': 0, 'リモートSC': 0, 'AI': 0}
     work_by_id  = {}
     labor_by_id = {}
+    days_by_id  = {}
 
     for _, row in df_active.iterrows():
         emp_id = str(row['従業員ID']).strip()
@@ -347,12 +387,18 @@ def _calc_labor(df_work, df_master, df_wage, master_ids, working):
         site_labor[site_d] = site_labor.get(site_d, 0) + cost
         work_by_id[lookup]  = work_by_id[emp_id]  = hours
         labor_by_id[lookup] = labor_by_id[emp_id] = cost
+        days_by_id[lookup]  = days_by_id[emp_id]  = days
 
     return site_labor, work_by_id, labor_by_id
 
 
-def _calc_daily(df_apo, date_str, site_map,
-                calls_by_date, ops_by_date, day_num):
+def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num):
+    """
+    1営業日分の集計
+    【売上加算】取得日 = date_str のアポ（再送除外・幸野除外）
+    【売上マイナス】キャンセル受付日 = date_str のもの（取得日不問・幸野除外）
+    """
+    # 獲得
     df_g = df_apo[
         (df_apo['取得日'] == date_str) &
         (df_apo['再送当否'].astype(str).str.strip() != '再送') &
@@ -360,6 +406,7 @@ def _calc_daily(df_apo, date_str, site_map,
     ].copy()
     df_g['site_raw'] = df_g['スタッフ名'].map(site_map)
 
+    # キャンセル（取得日不問・考慮除外・幸野除外）
     df_c = df_apo[
         (df_apo['cancel_date_str'] == date_str) &
         (df_apo['スタッフ名'] != KONO)
@@ -384,14 +431,15 @@ def _calc_daily(df_apo, date_str, site_map,
     return result
 
 
-def _calc_heatmap(df_apo, target_dates, total_sales):
+def _calc_heatmap(df_apo, biz_dates, total_sales):
+    """案件別ヒートマップTOP10（当月取得・当月キャンセルベース）"""
     df_g = df_apo[
-        df_apo['取得日'].isin(target_dates) &
+        df_apo['取得日'].isin(biz_dates) &
         (df_apo['再送当否'].astype(str).str.strip() != '再送') &
         (df_apo['スタッフ名'] != KONO)
     ].copy()
     df_c = df_apo[
-        df_apo['cancel_date_str'].isin(target_dates) &
+        df_apo['cancel_date_str'].isin(biz_dates) &
         (df_apo['スタッフ名'] != KONO)
     ].copy()
     pg = df_g.groupby('登録案件名').agg(
@@ -410,21 +458,31 @@ def _calc_heatmap(df_apo, target_dates, total_sales):
     ]
 
 
-def _calc_operators(df_apo, target_dates, df_master, df_prod,
-                    work_by_id, labor_by_id, id_map,
-                    site_map, rank_map, inc_map,
-                    elapsed, working, prev_calls):
+def _calc_operators(df_apo, biz_dates, df_master, df_prod,
+                    work_by_id, labor_by_id, id_map, site_map, rank_map,
+                    inc_map, elapsed, working):
+    """
+    OP個人実績（当月営業日ベース・毎回ゼロから計算）
+    【売上】取得日が当月 - キャンセル受付日が当月（考慮込み）
+    【コール】生産性レポートから当月合計
+    """
+    # 獲得（取得日が当月）
     df_get = df_apo[
-        df_apo['取得日'].isin(target_dates) &
+        df_apo['取得日'].isin(biz_dates) &
         (df_apo['再送当否'].astype(str).str.strip() != '再送')
     ].copy()
+
+    # キャンセル（OP実績用・考慮込み）
+    kouryo_dates = set()
+    for d in biz_dates:
+        kouryo_dates.add(d)
     kouryo = (
         df_apo['cancel_date_str'].str.contains('考慮', na=False) &
         df_apo['cancel_date_str'].str.extract(
-            r'(\d{4}/\d+/\d+)', expand=False).isin(target_dates)
+            r'(\d{4}/\d+/\d+)', expand=False).isin(biz_dates)
     )
-    df_cxl_op   = df_apo[df_apo['cancel_date_str'].isin(target_dates) | kouryo].copy()
-    df_cxl_dash = df_apo[df_apo['cancel_date_str'].isin(target_dates)].copy()
+    df_cxl_op   = df_apo[df_apo['cancel_date_str'].isin(biz_dates) | kouryo].copy()
+    df_cxl_dash = df_apo[df_apo['cancel_date_str'].isin(biz_dates)].copy()
 
     op_get    = df_get.groupby('スタッフ名').agg(
         apo=('アポイントID', 'count'), sg=('sales', 'sum')).reset_index()
@@ -433,9 +491,11 @@ def _calc_operators(df_apo, target_dates, df_master, df_prod,
     op_cxl_d  = df_cxl_dash.groupby('スタッフ名').agg(
         cxl_d=('アポイントID', 'count'), sc_d=('sales', 'sum')).reset_index()
 
-    calls_new  = df_prod.groupby('エージェント')['コール数'].sum().to_dict()
-    all_names  = set(list(df_master['スタッフ名']) + list(op_get['スタッフ名']))
-    operators  = []
+    # コール（当月合計）
+    calls_total = df_prod.groupby('エージェント')['コール数'].sum().to_dict()
+
+    all_names = set(list(df_master['スタッフ名']) + list(op_get['スタッフ名']))
+    operators = []
 
     for name in all_names:
         g  = op_get[op_get['スタッフ名'] == name]
@@ -447,23 +507,29 @@ def _calc_operators(df_apo, target_dates, df_master, df_prod,
         sc_op  = int(co['sc_op'].iloc[0])  if len(co) > 0 else 0
         cxl_d  = int(cd['cxl_d'].iloc[0]) if len(cd) > 0 else 0
         sc_d   = int(cd['sc_d'].iloc[0])   if len(cd) > 0 else 0
-        net_op   = sg - sc_op
-        net_dash = sg - sc_d
-        calls    = prev_calls.get(name, 0) + int(calls_new.get(name, 0))
-        emp_id   = id_map.get(name, '')
-        lookup   = B_TO_D.get(emp_id, emp_id)
-        hours    = work_by_id.get(lookup)  or work_by_id.get(emp_id, 0)
-        l_base   = labor_by_id.get(lookup) or labor_by_id.get(emp_id, 0)
-        inc_t    = inc_map.get(name, 0)
-        inc_day  = round(inc_t / working * elapsed) if inc_t > 0 else 0
-        labor    = l_base + inc_day
-        ar       = round(apo / calls * 100, 1)     if calls > 0 else None
-        cost_r   = round(labor / net_op * 100, 1)  if net_op > 0 and labor > 0 else None
-        site_d   = SITE_LABEL.get(site_map.get(name, ''), '')
-        rank_d   = rank_map.get(name, '')
-        # 稼働単価（売上÷出勤日数）
-        days_work = float(hours) / 8 if hours > 0 else 0  # 簡易換算
-        unit_pd   = round(net_op / days_work) if days_work > 0 and net_op > 0 else 0
+
+        net_op   = sg - sc_op   # OP実績（考慮込み）
+        net_dash = sg - sc_d    # ダッシュボード集計（考慮除外）
+        calls    = int(calls_total.get(name, 0))
+
+        emp_id = id_map.get(name, '')
+        lookup = B_TO_D.get(emp_id, emp_id)
+        hours  = work_by_id.get(lookup)  or work_by_id.get(emp_id, 0)
+        l_base = labor_by_id.get(lookup) or labor_by_id.get(emp_id, 0)
+        inc_t  = inc_map.get(name, 0)
+        inc_day= round(inc_t / working * elapsed) if inc_t > 0 else 0
+        labor  = l_base + inc_day
+
+        # 出勤日数（勤務データから）
+        days_key = B_TO_D.get(emp_id, emp_id)
+        # 簡易：hours÷8で推定（正確には別途days_by_idを渡す必要あり）
+        days = round(float(hours) / 8, 1) if hours > 0 else 0
+
+        ar     = round(apo / calls * 100, 1)    if calls > 0 else None
+        cost_r = round(labor / net_op * 100, 1) if net_op > 0 and labor > 0 else None
+        site_d = SITE_LABEL.get(site_map.get(name, ''), '')
+        rank_d = rank_map.get(name, '')
+        unit_pd= round(net_op / days) if days > 0 and net_op > 0 else 0
 
         operators.append({
             'name': name, 'site': site_d, 'rank': rank_d,
@@ -472,7 +538,7 @@ def _calc_operators(df_apo, target_dates, df_master, df_prod,
             'calls': calls, 'apoRate': ar,
             'workH': round(float(hours), 1), 'labor': labor,
             'labor_base': l_base, 'incentive_daily': inc_day,
-            'unitPerDay': unit_pd, 'costRate': cost_r,
+            'days': days, 'unitPerDay': unit_pd, 'costRate': cost_r,
         })
 
     operators.sort(key=lambda x: (-x['sales'] if x['sales'] > 0
