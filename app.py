@@ -344,14 +344,26 @@ def update():
         # ============================================================
         # 【修正】enrollCount・activeCount を計算
         # ============================================================
+        # ============================================================
+        # enrollCount・activeCount を計算
+        # 在籍 = マスターに存在する有効スタッフ（除外対象・ランクなし除く）
+        # アクティブ = 在籍スタッフ かつ 当月生産性レポートに名前がある
+        # ============================================================
+        master_names = set(df_master['スタッフ名'].tolist())
         enroll_ops = [op for op in operators
                       if op['name'].strip() not in EXCLUDE_ENROLL
-                      and op['rank'] in VALID_RANKS]
+                      and op['rank'] in VALID_RANKS
+                      and op['name'] in master_names]
         enroll_count = len(enroll_ops)
-        # 稼働：workH>0 または（月給制でdays>0）
+
+        # 生産性レポートに登場するスタッフ名のセット
+        if agent_col:
+            prod_names = set(df_prod[agent_col].astype(str).str.strip().tolist())
+        else:
+            prod_names = set()
         active_count = sum(
             1 for op in enroll_ops
-            if (op.get('workH') or 0) > 0 or (op.get('days') or 0) > 0
+            if op['name'] in prod_names
         )
 
         # ============================================================
