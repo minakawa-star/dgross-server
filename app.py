@@ -15,6 +15,7 @@ PT事業部 ダッシュボード更新サーバー v2
 import io
 import json
 import os
+import re
 import traceback
 import zipfile
 from datetime import date, timedelta
@@ -36,6 +37,9 @@ SITE_LABEL  = {'新宿SC': '新宿SC', '在宅G': 'リモートSC', 'AI': 'AI'}
 B_TO_D      = {'B0000106': 'D0000295', 'B0000107': 'D0000326'}
 KONO        = '幸野有希子CRM'   # 全体/サイト集計から除外
 EXCLUDE_OPS = ['堀川璃歩']      # 全集計から除外
+# 在籍カウント除外スタッフ（名前が空・ランクなし・退職者等）
+EXCLUDE_ENROLL = {'堀川璃歩', '堀川', ' 坂本杏奈1208', '藤公誉1212', '幸野有希子', '加藤隆治'}
+VALID_RANKS    = {'トップ', 'ミドル', 'ルーキープラス', 'ルーキー', '管理者', '社員'}
 
 # Supabaseクライアント
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
@@ -197,18 +201,14 @@ def update():
 
         # ============================================================
         # 当月営業日の特定
-        # アポイントリストの取得日から当月（5月）の日付を抽出
         # ============================================================
         all_get_dates = sorted(df_apo['取得日'].dropna().unique())
 
-        # 当月（前回pt_dataのmonthから年月を取得）
         month_str = prev_json['meta']['month']  # 例：2026年5月
-        import re
         m = re.search(r'(\d{4})年(\d+)月', month_str)
         target_year  = int(m.group(1))
         target_month = int(m.group(2))
 
-        # 当月営業日（取得日が当月のもの）
         biz_dates = sorted([
             d for d in all_get_dates
             if str(d).startswith(f'{target_year}/{str(target_month).zfill(2)}')
@@ -217,27 +217,37 @@ def update():
         if not biz_dates:
             return jsonify({'error': '当月のアポイントデータが見つかりません'}), 400
 
-        elapsed = len(biz_dates)  # 経過営業日数
+        elapsed = len(biz_dates)
 
         # ============================================================
         # 人件費計算（勤務データから）
+        # 【修正】days_by_id も返すよう変更
         # ============================================================
-        site_labor, work_by_id, labor_by_id = _calc_labor(
+        site_labor, work_by_id, labor_by_id, days_by_id = _calc_labor(
             df_work, df_master, df_wage, master_ids, working)
 
         # ============================================================
         # コール・稼働人数（生産性レポートから日次集計）
+        # 【修正】日付フォーマットを正規化して突合
         # ============================================================
         calls_by_date = {}
         ops_by_date   = {}
+
+        # 生産性レポートの日付列を正規化（yyyy/mm/dd or yyyy-mm-dd → yyyy/mm/dd）
+        if '日付' in df_prod.columns:
+            df_prod['日付_norm'] = (df_prod['日付'].astype(str)
+                                    .str.replace('-', '/')
+                                    .str.strip())
+        else:
+            df_prod['日付_norm'] = ''
+
         for d in biz_dates:
-            d_prod = d.replace('/', '-')
-            mask = df_prod['日付'] == d_prod
-            calls_by_date[d] = int(df_prod[mask]['コール数'].sum())
+            mask = df_prod['日付_norm'] == d
+            calls_by_date[d] = int(df_prod[mask]['コール数'].sum()) if mask.any() else 0
             ops_by_date[d]   = int(len(df_prod[mask]))
 
         # ============================================================
-        # 日次明細（当月全営業日を毎回ゼロから作り直す）
+        # 日次明細
         # ============================================================
         daily = {'all': [], 'shinjuku': [], 'remote': [], 'ai': []}
         for i, date_str in enumerate(biz_dates, 1):
@@ -247,9 +257,8 @@ def update():
                 daily[key].append(d[key])
 
         # ============================================================
-        # サイト別累計（日次明細から積み上げ）
+        # サイト別累計
         # ============================================================
-        # インセンティブ日割り
         inc_site = {'新宿SC': 0, 'リモートSC': 0, 'AI': 0}
         for name, inc_total in inc_map.items():
             if inc_total <= 0:
@@ -265,7 +274,8 @@ def update():
             sales  = sum(r['sales']  for r in rows)
             apo    = sum(r['apo']    for r in rows)
             cancel = sum(r['cancel'] for r in rows)
-            calls  = sum(r['calls']  for r in rows)
+            # 【修正】calls は daily['all'] の合計を使う（サイト別callsは0のため）
+            calls  = sum(r['calls']  for r in daily['all']) if k == 'all' else 0
             valid  = apo - cancel
             cr     = round(cancel / apo * 100, 1) if apo > 0 else 0
             site_jp = {'all': None, 'shinjuku': '新宿SC',
@@ -281,10 +291,9 @@ def update():
             cost   = round(labor / sales * 100, 1) if sales > 0 else 0
             ar     = round(apo / calls * 100, 2)   if calls > 0 else 0
             last   = rows[-1] if rows else {}
-            # 稼働単価：当月累計売上 ÷ 当月累計出勤日数（重み付き平均）
             all_ops = [op for op in _calc_operators(
                 df_apo, biz_dates, df_master, df_prod,
-                work_by_id, labor_by_id, id_map, site_map, rank_map,
+                work_by_id, labor_by_id, days_by_id, id_map, site_map, rank_map,
                 inc_map, elapsed, working)
                 if (k == 'all' or op['site'] == site_jp)
                 and op['sales'] > 0 and op.get('days', 0) > 0]
@@ -310,17 +319,30 @@ def update():
                 chart_data[idx] = round(row['sales'] / 10000, 1)
 
         # ============================================================
-        # ヒートマップ（当月営業日ベース）
+        # ヒートマップ
         # ============================================================
         heatmap = _calc_heatmap(df_apo, biz_dates, sites['all']['sales'])
 
         # ============================================================
-        # OP個人実績（当月営業日ベース・毎回ゼロから計算）
+        # OP個人実績
         # ============================================================
         operators = _calc_operators(
             df_apo, biz_dates, df_master, df_prod,
-            work_by_id, labor_by_id, id_map, site_map, rank_map,
+            work_by_id, labor_by_id, days_by_id, id_map, site_map, rank_map,
             inc_map, elapsed, working)
+
+        # ============================================================
+        # 【修正】enrollCount・activeCount を計算
+        # ============================================================
+        enroll_ops = [op for op in operators
+                      if op['name'].strip() not in EXCLUDE_ENROLL
+                      and op['rank'] in VALID_RANKS]
+        enroll_count = len(enroll_ops)
+        # 稼働：workH>0 または（月給制でdays>0）
+        active_count = sum(
+            1 for op in enroll_ops
+            if (op.get('workH') or 0) > 0 or (op.get('days') or 0) > 0
+        )
 
         # ============================================================
         # PT_DATA組み立て
@@ -337,6 +359,8 @@ def update():
                 'elapsedDays':     elapsed,
                 'workingDays':     working,
                 'alertText':       f"{last_date}のデータを反映済みです（累計{elapsed}営業日）。最終更新: {today}",
+                'enrollCount':     enroll_count,   # 【追加】在籍数
+                'activeCount':     active_count,   # 【追加】稼働数
             },
             'targets':   targets,
             'sites':     sites,
@@ -363,7 +387,6 @@ def update():
 # ヘルパー関数
 # ============================================================
 def _extract_work_from_zip(file_bytes):
-    """zip圧縮の勤務データを展開してcsvバイトを返す。csvの場合はそのまま返す"""
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             csv_files = [n for n in zf.namelist() if n.lower().endswith('.csv')]
@@ -442,18 +465,24 @@ def _load_incentive(file_bytes):
 
 
 def _calc_labor(df_work, df_master, df_wage, master_ids, working):
-    """人件費計算（勤務データ全期間から）"""
+    """
+    人件費計算（勤務データ全期間から）
+    【修正】
+    - 月給制スタッフは総労働時間=0でも出勤日数>0なら稼働扱い
+    - days_by_id を返す（_calc_operatorsで出勤日数に使用）
+    """
     site_map_id = dict(zip(df_master['社員番号'], df_master['サイト']))
     wage_by_id  = dict(zip(df_wage['社員番号'], df_wage['時給']))
     note_by_id  = dict(zip(df_wage['社員番号'], df_wage['備考']))
-    df_active   = df_work[(df_work['出勤日数'] >= 1) & (df_work['総労働時間'] > 0)]
 
+    # 【修正】月給制は出勤日数>0のみで稼働判定、時給制は従来通り
+    # まず全行をループして月給/時給で条件分岐
     site_labor  = {'新宿SC': 0, 'リモートSC': 0, 'AI': 0}
     work_by_id  = {}
     labor_by_id = {}
     days_by_id  = {}
 
-    for _, row in df_active.iterrows():
+    for _, row in df_work.iterrows():
         emp_id = str(row['従業員ID']).strip()
         hours  = float(row['総労働時間'])
         days   = float(row['出勤日数'])
@@ -467,23 +496,28 @@ def _calc_labor(df_work, df_master, df_wage, master_ids, working):
         if not wage:
             continue
         wage = float(wage)
-        cost = (round(wage * 1.15 / working * days)
-                if '月給' in note else round(wage * hours))
+        is_monthly = '月給' in note
+
+        # 【修正】稼働判定：月給制は出勤日数>0、時給制は労働時間>0
+        if is_monthly:
+            if days <= 0:
+                continue
+            cost = round(wage * 1.15 / working * days)
+        else:
+            if hours <= 0:
+                continue
+            cost = round(wage * hours)
+
         site_labor[site_d] = site_labor.get(site_d, 0) + cost
         work_by_id[lookup]  = work_by_id[emp_id]  = hours
         labor_by_id[lookup] = labor_by_id[emp_id] = cost
-        days_by_id[lookup]  = days_by_id[emp_id]  = days
+        days_by_id[lookup]  = days_by_id[emp_id]  = days  # 【追加】出勤日数を保存
 
-    return site_labor, work_by_id, labor_by_id
+    return site_labor, work_by_id, labor_by_id, days_by_id  # 【修正】days_by_idを追加
 
 
 def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num):
-    """
-    1営業日分の集計
-    【売上加算】取得日 = date_str のアポ（再送除外・幸野除外）
-    【売上マイナス】キャンセル受付日 = date_str のもの（取得日不問・幸野除外）
-    """
-    # 獲得
+    """1営業日分の集計"""
     df_g = df_apo[
         (df_apo['取得日'] == date_str) &
         (df_apo['再送当否'].astype(str).str.strip() != '再送') &
@@ -491,7 +525,6 @@ def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num)
     ].copy()
     df_g['site_raw'] = df_g['スタッフ名'].map(site_map)
 
-    # キャンセル（取得日不問・考慮除外・幸野除外）
     df_c = df_apo[
         (df_apo['cancel_date_str'] == date_str) &
         (df_apo['スタッフ名'] != KONO)
@@ -517,7 +550,6 @@ def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num)
 
 
 def _calc_heatmap(df_apo, biz_dates, total_sales):
-    """案件別ヒートマップTOP10（当月取得・当月キャンセルベース）"""
     df_g = df_apo[
         df_apo['取得日'].isin(biz_dates) &
         (df_apo['再送当否'].astype(str).str.strip() != '再送') &
@@ -544,23 +576,17 @@ def _calc_heatmap(df_apo, biz_dates, total_sales):
 
 
 def _calc_operators(df_apo, biz_dates, df_master, df_prod,
-                    work_by_id, labor_by_id, id_map, site_map, rank_map,
-                    inc_map, elapsed, working):
+                    work_by_id, labor_by_id, days_by_id, id_map,
+                    site_map, rank_map, inc_map, elapsed, working):
     """
-    OP個人実績（当月営業日ベース・毎回ゼロから計算）
-    【売上】取得日が当月 - キャンセル受付日が当月（考慮込み）
-    【コール】生産性レポートから当月合計
+    OP個人実績
+    【修正】days_by_id を受け取り、hours÷8の推定をやめて実際の出勤日数を使用
     """
-    # 獲得（取得日が当月）
     df_get = df_apo[
         df_apo['取得日'].isin(biz_dates) &
         (df_apo['再送当否'].astype(str).str.strip() != '再送')
     ].copy()
 
-    # キャンセル（OP実績用・考慮込み）
-    kouryo_dates = set()
-    for d in biz_dates:
-        kouryo_dates.add(d)
     kouryo = (
         df_apo['cancel_date_str'].str.contains('考慮', na=False) &
         df_apo['cancel_date_str'].str.extract(
@@ -576,8 +602,13 @@ def _calc_operators(df_apo, biz_dates, df_master, df_prod,
     op_cxl_d  = df_cxl_dash.groupby('スタッフ名').agg(
         cxl_d=('アポイントID', 'count'), sc_d=('sales', 'sum')).reset_index()
 
-    # コール（当月合計）
-    calls_total = df_prod.groupby('エージェント')['コール数'].sum().to_dict()
+    # 生産性レポートのコール集計（日付正規化済み列を使用）
+    if '日付_norm' in df_prod.columns:
+        prod_month = df_prod[df_prod['日付_norm'].str.startswith(
+            biz_dates[0][:7] if biz_dates else '')]
+    else:
+        prod_month = df_prod
+    calls_total = prod_month.groupby('エージェント')['コール数'].sum().to_dict()
 
     all_names = set(list(df_master['スタッフ名']) + list(op_get['スタッフ名']))
     operators = []
@@ -593,8 +624,8 @@ def _calc_operators(df_apo, biz_dates, df_master, df_prod,
         cxl_d  = int(cd['cxl_d'].iloc[0]) if len(cd) > 0 else 0
         sc_d   = int(cd['sc_d'].iloc[0])   if len(cd) > 0 else 0
 
-        net_op   = sg - sc_op   # OP実績（考慮込み）
-        net_dash = sg - sc_d    # ダッシュボード集計（考慮除外）
+        net_op   = sg - sc_op
+        net_dash = sg - sc_d
         calls    = int(calls_total.get(name, 0))
 
         emp_id = id_map.get(name, '')
@@ -605,10 +636,12 @@ def _calc_operators(df_apo, biz_dates, df_master, df_prod,
         inc_day= round(inc_t / working * elapsed) if inc_t > 0 else 0
         labor  = l_base + inc_day
 
-        # 出勤日数（勤務データから）
-        days_key = B_TO_D.get(emp_id, emp_id)
-        # 簡易：hours÷8で推定（正確には別途days_by_idを渡す必要あり）
-        days = round(float(hours) / 8, 1) if hours > 0 else 0
+        # 【修正】出勤日数：days_by_idから取得（なければhours÷8で推定）
+        days = days_by_id.get(lookup) or days_by_id.get(emp_id)
+        if days is None:
+            days = round(float(hours) / 8, 1) if hours and float(hours) > 0 else 0
+        else:
+            days = float(days)
 
         ar     = round(apo / calls * 100, 1)    if calls > 0 else None
         cost_r = round(labor / net_op * 100, 1) if net_op > 0 and labor > 0 else None
@@ -621,7 +654,8 @@ def _calc_operators(df_apo, biz_dates, df_master, df_prod,
             'sales': net_op, 'sales_dash': net_dash,
             'apo': apo, 'cancel': cxl_op, 'valid': apo - cxl_op,
             'calls': calls, 'apoRate': ar,
-            'workH': round(float(hours), 1), 'labor': labor,
+            'workH': round(float(hours), 1) if hours else None,
+            'labor': labor,
             'labor_base': l_base, 'incentive_daily': inc_day,
             'days': days, 'unitPerDay': unit_pd, 'costRate': cost_r,
         })
