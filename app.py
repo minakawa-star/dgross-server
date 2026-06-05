@@ -577,7 +577,6 @@ def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num)
     """1営業日分の集計"""
     df_g = df_apo[
         (df_apo['取得日'] == date_str) &
-        (df_apo['再送当否'].astype(str).str.strip() != '再送') &
         (df_apo['スタッフ名'] != KONO)
     ].copy()
     df_g['site_raw'] = df_g['スタッフ名'].map(site_map)
@@ -609,7 +608,6 @@ def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num)
 def _calc_heatmap(df_apo, biz_dates, total_sales):
     df_g = df_apo[
         df_apo['取得日'].isin(biz_dates) &
-        (df_apo['再送当否'].astype(str).str.strip() != '再送') &
         (df_apo['スタッフ名'] != KONO)
     ].copy()
     df_c = df_apo[
@@ -640,8 +638,7 @@ def _calc_operators(df_apo, biz_dates, df_master, df_prod,
     【修正】days_by_id を受け取り、hours÷8の推定をやめて実際の出勤日数を使用
     """
     df_get = df_apo[
-        df_apo['取得日'].isin(biz_dates) &
-        (df_apo['再送当否'].astype(str).str.strip() != '再送')
+        df_apo['取得日'].isin(biz_dates)
     ].copy()
 
     kouryo = (
