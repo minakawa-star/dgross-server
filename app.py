@@ -34,6 +34,8 @@ CORS(app)
 # 定数
 # ============================================================
 SITE_LABEL  = {'新宿SC': '新宿SC', '在宅G': 'リモートSC', 'AI': 'AI'}
+# 6月以降用（新宿SC→六本木SC）
+SITE_LABEL_JUNE = {'新宿SC': '六本木SC', '在宅G': 'リモートSC', 'AI': 'AI'}
 B_TO_D      = {'B0000106': 'D0000295', 'B0000107': 'D0000326', 'D0001318': 'B0000095'}
 KONO        = '幸野有希子CRM'   # 全体/サイト集計から除外
 EXCLUDE_OPS = ['堀川璃歩']      # 全集計から除外
@@ -219,8 +221,9 @@ def update():
 
         elapsed = len(biz_dates)
 
-        # 6月以降は幸野有希子CRMを通常スタッフとして全集計に含める
-        kono_excluded = target_month < 6  # True=除外（5月まで）, False=含める（6月以降）
+        # 6月以降は新宿SC→六本木SCに表示変更
+        kono_excluded = target_month < 6
+        site_label = SITE_LABEL_JUNE if target_month >= 6 else SITE_LABEL
 
         # ============================================================
         # jinjer勤務データの期間検証
@@ -245,7 +248,7 @@ def update():
         # 【修正】days_by_id も返すよう変更
         # ============================================================
         site_labor, work_by_id, labor_by_id, days_by_id = _calc_labor(
-            df_work, df_master, df_wage, master_ids, working)
+            df_work, df_master, df_wage, master_ids, working, site_label)
 
         # ============================================================
         # コール・稼働人数（生産性レポートから日次集計）
@@ -290,11 +293,12 @@ def update():
         # ============================================================
         # サイト別累計
         # ============================================================
-        inc_site = {'新宿SC': 0, 'リモートSC': 0, 'AI': 0}
+        shinjuku_label = site_label.get('新宿SC', '新宿SC')  # 5月=新宿SC, 6月=六本木SC
+        inc_site = {shinjuku_label: 0, 'リモートSC': 0, 'AI': 0}
         for name, inc_total in inc_map.items():
             if inc_total <= 0:
                 continue
-            site = SITE_LABEL.get(site_map.get(name, ''), '')
+            site = site_label.get(site_map.get(name, ''), '')
             if site in inc_site:
                 inc_site[site] += round(inc_total / working * elapsed)
         inc_all = sum(inc_site.values())
@@ -305,15 +309,14 @@ def update():
             sales  = sum(r['sales']  for r in rows)
             apo    = sum(r['apo']    for r in rows)
             cancel = sum(r['cancel'] for r in rows)
-            # 【修正】calls は daily['all'] の合計を使う（サイト別callsは0のため）
             calls  = sum(r['calls']  for r in daily['all']) if k == 'all' else 0
             valid  = apo - cancel
             cr     = round(cancel / apo * 100, 1) if apo > 0 else 0
-            site_jp = {'all': None, 'shinjuku': '新宿SC',
+            site_jp = {'all': None, 'shinjuku': shinjuku_label,
                        'remote': 'リモートSC', 'ai': 'AI'}[k]
             jinjer = {
                 'all':      sum(site_labor.values()),
-                'shinjuku': site_labor.get('新宿SC', 0),
+                'shinjuku': site_labor.get(shinjuku_label, 0),
                 'remote':   site_labor.get('リモートSC', 0),
                 'ai':       site_labor.get('AI', 0),
             }[k]
@@ -325,7 +328,7 @@ def update():
             all_ops = [op for op in _calc_operators(
                 df_apo, biz_dates, df_master, df_prod,
                 work_by_id, labor_by_id, days_by_id, id_map, site_map, rank_map,
-                inc_map, elapsed, working, kono_excluded)
+                inc_map, elapsed, working, kono_excluded, site_label)
                 if (k == 'all' or op['site'] == site_jp)
                 and op['sales'] > 0 and op.get('days', 0) > 0]
             ts = sum(o['sales'] for o in all_ops)
@@ -360,7 +363,7 @@ def update():
         operators = _calc_operators(
             df_apo, biz_dates, df_master, df_prod,
             work_by_id, labor_by_id, days_by_id, id_map, site_map, rank_map,
-            inc_map, elapsed, working, kono_excluded)
+            inc_map, elapsed, working, kono_excluded, site_label)
 
         # ============================================================
         # 【修正】enrollCount・activeCount を計算
@@ -527,20 +530,18 @@ def _load_incentive(file_bytes):
     return result
 
 
-def _calc_labor(df_work, df_master, df_wage, master_ids, working):
-    """
-    人件費計算（勤務データ全期間から）
-    【修正】
-    - 月給制スタッフは総労働時間=0でも出勤日数>0なら稼働扱い
-    - days_by_id を返す（_calc_operatorsで出勤日数に使用）
-    """
+def _calc_labor(df_work, df_master, df_wage, master_ids, working, site_label=None):
+    """人件費計算"""
+    if site_label is None:
+        site_label = SITE_LABEL
     site_map_id = dict(zip(df_master['社員番号'], df_master['サイト']))
     wage_by_id  = dict(zip(df_wage['社員番号'], df_wage['時給']))
     note_by_id  = dict(zip(df_wage['社員番号'], df_wage['備考']))
 
     # 【修正】月給制は出勤日数>0のみで稼働判定、時給制は従来通り
     # まず全行をループして月給/時給で条件分岐
-    site_labor  = {'新宿SC': 0, 'リモートSC': 0, 'AI': 0}
+    shinjuku_key = site_label.get('新宿SC', '新宿SC')
+    site_labor  = {shinjuku_key: 0, 'リモートSC': 0, 'AI': 0}
     work_by_id  = {}
     labor_by_id = {}
     days_by_id  = {}
@@ -553,7 +554,7 @@ def _calc_labor(df_work, df_master, df_wage, master_ids, working):
         if lookup not in master_ids and emp_id not in master_ids:
             continue
         site_r = site_map_id.get(lookup) or site_map_id.get(emp_id, '')
-        site_d = SITE_LABEL.get(site_r, 'その他')
+        site_d = site_label.get(site_r, 'その他')
         wage   = wage_by_id.get(lookup) or wage_by_id.get(emp_id)
         note   = str(note_by_id.get(lookup) or note_by_id.get(emp_id, ''))
         if not wage:
@@ -658,8 +659,11 @@ def _calc_heatmap(df_apo, biz_dates, total_sales, kono_excluded=True):
 
 def _calc_operators(df_apo, biz_dates, df_master, df_prod,
                     work_by_id, labor_by_id, days_by_id, id_map,
-                    site_map, rank_map, inc_map, elapsed, working, kono_excluded=True):
+                    site_map, rank_map, inc_map, elapsed, working,
+                    kono_excluded=True, site_label=None):
     """OP個人実績"""
+    if site_label is None:
+        site_label = SITE_LABEL
     kono_filter_get = (df_apo['スタッフ名'] != KONO) if kono_excluded else pd.Series([True]*len(df_apo), index=df_apo.index)
     df_get = df_apo[
         df_apo['取得日'].isin(biz_dates) &
@@ -733,7 +737,7 @@ def _calc_operators(df_apo, biz_dates, df_master, df_prod,
 
         ar     = round(apo / calls * 100, 1)    if calls > 0 else None
         cost_r = round(labor / net_op * 100, 1) if net_op > 0 and labor > 0 else None
-        site_d = SITE_LABEL.get(site_map.get(name, ''), '')
+        site_d = site_label.get(site_map.get(name, ''), '')
         rank_d = rank_map.get(name, '')
         unit_pd= round(net_op / days) if days > 0 and net_op > 0 else 0
 
