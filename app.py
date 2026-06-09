@@ -194,7 +194,14 @@ def update():
         df_prod = _load_csv(prod_file)
 
         # --- 勤務データ読み込み ---
-        df_work = _load_work(work_file)
+        work_data = _load_work(work_file)
+        df_work   = work_data['df_monthly']   # 月累計（_calc_laborに渡す）
+        df_work_daily = work_data['df_daily'] # 日次（日次人件費計算用）None if monthly
+
+        # 汎用データの場合は最大日付を終了日として使用
+        if work_data['type'] == 'daily' and df_work_daily is not None and len(df_work_daily) > 0:
+            work_end_date = df_work_daily['年月日'].max()  # YYYY/MM/DD形式
+        # work_end_dateは_extract_work_from_zipで取得済み（月累計の場合）
 
         # --- 設定値（前回pt_dataから引き継ぐもの）---
         working  = prev_json['meta']['workingDays']   # 当月営業日数
@@ -368,20 +375,71 @@ def update():
 
         # ============================================================
         # 日次×個人成果（日次明細モーダル用）
-        # 各営業日ごとのスタッフ別アポ・売上・原価率を集計
         # ============================================================
         kono_f = (df_apo['スタッフ名'] != KONO) if kono_excluded else pd.Series([True]*len(df_apo), index=df_apo.index)
-        # 日次人件費（1日あたり）
-        daily_labor_per_day = round(sites['all']['labor'] / elapsed) if elapsed > 0 else 0
+
+        # 【汎用データ対応】日次労働時間マップを構築
+        # df_work_daily が存在する場合（汎用データ）: 日次実労働時間ベース
+        # 存在しない場合（月累計）: 月次÷経過日数の均等割り
+        daily_labor_per_day_default = round(sites['all']['labor'] / elapsed) if elapsed > 0 else 0
+
+        # 時給マスター（日次人件費計算用）
+        wage_by_id_d  = dict(zip(df_wage['社員番号'], df_wage['時給'].astype(float)))
+        note_by_id_d  = dict(zip(df_wage['社員番号'], df_wage['備考']))
+        name_to_id    = dict(zip(df_master['スタッフ名'], df_master['社員番号']))
+
+        def _daily_labor_for_staff(name, date_str):
+            """スタッフの当日人件費を計算"""
+            if df_work_daily is None:
+                # 月累計均等割り
+                op = next((o for o in operators if o['name'] == name), None)
+                return round((op.get('labor',0) or 0) / elapsed) if op and elapsed > 0 else 0
+            # 汎用データから当日の実労働時間を取得
+            emp_id = name_to_id.get(name, '')
+            lookup = B_TO_D.get(emp_id, emp_id)
+            mask = (df_work_daily['従業員ID'] == lookup) | (df_work_daily['従業員ID'] == emp_id)
+            rows_d = df_work_daily[mask & (df_work_daily['年月日'] == date_str)]
+            h = float(rows_d['実労働h'].sum()) if len(rows_d) > 0 else 0.0
+            if h <= 0:
+                return 0
+            wage = wage_by_id_d.get(lookup) or wage_by_id_d.get(emp_id, 0)
+            note = str(note_by_id_d.get(lookup) or note_by_id_d.get(emp_id, ''))
+            if not wage:
+                return 0
+            if '月給' in note:
+                return round(float(wage) * 1.15 / working)
+            return round(float(wage) * h)
+
+        # 日次全体人件費（daily行に付与）
+        def _daily_total_labor(date_str):
+            if df_work_daily is None:
+                return daily_labor_per_day_default
+            mask = df_work_daily['年月日'] == date_str
+            rows_d = df_work_daily[mask]
+            total = 0
+            for _, wr in rows_d.iterrows():
+                emp_id = str(wr['従業員ID'])
+                lookup = B_TO_D.get(emp_id, emp_id)
+                h = float(wr['実労働h'])
+                if h <= 0: continue
+                wage = wage_by_id_d.get(lookup) or wage_by_id_d.get(emp_id, 0)
+                note = str(note_by_id_d.get(lookup) or note_by_id_d.get(emp_id, ''))
+                if not wage: continue
+                if '月給' in note:
+                    total += round(float(wage) * 1.15 / working)
+                else:
+                    total += round(float(wage) * h)
+            return total if total > 0 else daily_labor_per_day_default
+
+        # daily['all']の各行にdaily_laborを付与
+        for row in daily['all']:
+            row['daily_labor'] = _daily_total_labor(row['date'])
 
         daily_ops_by_date = {}
         for date_str in biz_dates:
-            # 当日取得アポ
             df_d_get = df_apo[(df_apo['取得日'] == date_str) & kono_f].copy()
-            # 当日キャンセル
             df_d_cxl = df_apo[(df_apo['cancel_date_str'] == date_str) & kono_f].copy()
 
-            # スタッフ別集計
             g_apo = df_d_get.groupby('スタッフ名').agg(
                 apo=('アポイントID','count'), sg=('sales','sum')).reset_index()
             g_cxl = df_d_cxl.groupby('スタッフ名').agg(
@@ -390,7 +448,6 @@ def update():
             g['valid'] = (g['apo'] - g['cxl']).astype(int)
             g['net']   = (g['sg']  - g['sc']).astype(int)
 
-            # 案件別内訳（スタッフ×案件）
             proj_by_staff = df_d_get.groupby(['スタッフ名','登録案件名']).agg(
                 p_apo=('アポイントID','count'), p_sales=('sales','sum')).reset_index()
             proj_cxl_by_staff = df_d_cxl.groupby(['スタッフ名','登録案件名']).agg(
@@ -398,41 +455,30 @@ def update():
             proj_m = proj_by_staff.merge(proj_cxl_by_staff, on=['スタッフ名','登録案件名'], how='left').fillna(0)
             proj_m['p_valid'] = (proj_m['p_apo'] - proj_m['p_cxl']).astype(int)
 
-            # スタッフごとのlabor（月次人件費÷経過日数）
-            labor_map = {op['name']: round((op.get('labor',0) or 0) / elapsed) if elapsed > 0 else 0
-                         for op in operators}
-
             staff_list = []
             for _, row in g.iterrows():
-                name = str(row['スタッフ名'])
-                net  = int(row['net'])
-                labor_d = labor_map.get(name, 0)
+                name    = str(row['スタッフ名'])
+                net     = int(row['net'])
+                labor_d = _daily_labor_for_staff(name, date_str)
                 cost_r  = round(labor_d / net * 100, 1) if net > 0 and labor_d > 0 else None
-                # 当日の案件内訳（有効アポ>0のみ・有効数順）
-                projs = proj_m[proj_m['スタッフ名'] == name].copy()
+                projs   = proj_m[proj_m['スタッフ名'] == name].copy()
                 proj_list = [
-                    {'name': str(r['登録案件名']),
-                     'valid': int(r['p_valid']),
+                    {'name': str(r['登録案件名']), 'valid': int(r['p_valid']),
                      'sales': int(r['p_sales'] - r['p_sc'])}
                     for _, r in projs.iterrows() if int(r['p_valid']) > 0
                 ]
                 proj_list.sort(key=lambda x: -x['valid'])
                 staff_list.append({
-                    'name':     name,
-                    'sales':    net,
-                    'valid':    int(row['valid']),
-                    'costRate': cost_r,
-                    'projects': proj_list
+                    'name': name, 'sales': net, 'valid': int(row['valid']),
+                    'costRate': cost_r, 'projects': proj_list
                 })
 
-            # 当日売上の高い順にソート
             staff_list.sort(key=lambda x: (-x['sales'], -x['valid']))
             daily_ops_by_date[date_str] = staff_list
 
         # daily['all']の各行にdaily_opsを付与
-        for i, row in enumerate(daily['all']):
-            date_str = row['date']
-            row['daily_ops'] = daily_ops_by_date.get(date_str, [])
+        for row in daily['all']:
+            row['daily_ops'] = daily_ops_by_date.get(row['date'], [])
 
         # ============================================================
         # 【修正】enrollCount・activeCount を計算
@@ -573,17 +619,75 @@ def _load_csv(file_bytes):
     raise ValueError('CSVの読み込みに失敗しました')
 
 
+def _parse_hhmm(t):
+    """HH:MM形式の時間文字列をfloat（時間）に変換"""
+    if pd.isna(t): return 0.0
+    t = str(t).strip()
+    if ':' not in t: return 0.0
+    parts = t.split(':')
+    try:
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        return h + m / 60.0
+    except:
+        return 0.0
+
+
 def _load_work(file_bytes):
-    for enc in ['cp932', 'utf-8-sig']:
+    """
+    jinjer勤務データの読み込み。汎用データ（日次）・月累計の両形式に対応。
+
+    【汎用データの判定条件】
+    列に「*年月日」「実労働時間」が存在する場合 → 汎用データ（日次×スタッフ）
+    それ以外 → 従来の月累計データ
+
+    【戻り値】
+    {
+      'type': 'daily' | 'monthly',
+      'df_daily': DataFrame（日次×スタッフ：従業員ID, 年月日, 実労働h）または None,
+      'df_monthly': DataFrame（スタッフ別月累計：従業員ID, 総労働時間, 出勤日数）
+    }
+    """
+    for enc in ['cp932', 'utf-8-sig', 'utf-8']:
         try:
             df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
-            df = df.dropna(subset=['従業員ID'])
-            df['総労働時間'] = pd.to_numeric(df['総労働時間'], errors='coerce').fillna(0)
-            df['出勤日数']   = pd.to_numeric(df['出勤日数'],   errors='coerce').fillna(0)
-            return df.sort_values('総労働時間', ascending=False).drop_duplicates(subset='従業員ID')
+            break
         except Exception:
             continue
-    raise ValueError('勤務データの読み込みに失敗しました')
+    else:
+        raise ValueError('勤務データの読み込みに失敗しました')
+
+    # 汎用データ判定
+    is_hanyo = ('*年月日' in df.columns and '実労働時間' in df.columns and '*従業員ID' in df.columns)
+
+    if is_hanyo:
+        # --- 汎用データ（日次）---
+        df = df.dropna(subset=['*従業員ID'])
+        df['*従業員ID'] = df['*従業員ID'].astype(str).str.strip()
+        df['年月日'] = pd.to_datetime(df['*年月日'], errors='coerce')
+        df['年月日str'] = df['年月日'].dt.strftime('%Y/%m/%d')
+        df['実労働h'] = df['実労働時間'].apply(_parse_hhmm)
+
+        # 日次データ（従業員ID × 日付 × 実労働h）
+        df_daily = df[['*従業員ID', '年月日str', '実労働h']].copy()
+        df_daily.columns = ['従業員ID', '年月日', '実労働h']
+        df_daily = df_daily[df_daily['実労働h'] > 0].reset_index(drop=True)
+
+        # 月累計集約（_calc_laborへの互換）
+        monthly = df.groupby('*従業員ID').agg(
+            総労働時間=('実労働h', 'sum'),
+            出勤日数=('実労働h', lambda x: (x > 0).sum())
+        ).reset_index().rename(columns={'*従業員ID': '従業員ID'})
+
+        return {'type': 'daily', 'df_daily': df_daily, 'df_monthly': monthly}
+
+    else:
+        # --- 従来の月累計データ ---
+        df = df.dropna(subset=['従業員ID'])
+        df['総労働時間'] = pd.to_numeric(df['総労働時間'], errors='coerce').fillna(0)
+        df['出勤日数']   = pd.to_numeric(df['出勤日数'],   errors='coerce').fillna(0)
+        monthly = df.sort_values('総労働時間', ascending=False).drop_duplicates(subset='従業員ID')
+        return {'type': 'monthly', 'df_daily': None, 'df_monthly': monthly}
 
 
 def _load_incentive(file_bytes):
