@@ -28,10 +28,7 @@ from openpyxl import load_workbook
 from supabase import create_client, Client
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": [
-    "https://minakawa-star.github.io",
-    "http://localhost:3000"
-]}})
+CORS(app)
 
 # ============================================================
 # 定数
