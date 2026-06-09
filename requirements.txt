@@ -5,3 +5,4 @@ openpyxl
 gunicorn==22.0.0
 requests
 supabase
+PyJWT
