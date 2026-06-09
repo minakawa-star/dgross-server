@@ -5,7 +5,6 @@ import datetime
 import pandas as pd
 from flask import jsonify, request
 from supabase import create_client
-from flask_cors import CORS
 
 SUPABASE_STAFF_URL = os.environ.get("SUPABASE_STAFF_URL")
 SUPABASE_STAFF_KEY = os.environ.get("SUPABASE_STAFF_KEY")
