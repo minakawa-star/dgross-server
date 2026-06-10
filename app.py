@@ -325,7 +325,7 @@ def update():
         for k in ['all', 'shinjuku', 'remote', 'ai']:
             site_jp = {'all': None, 'shinjuku': shinjuku_label,
                        'remote': 'リモートSC', 'ai': 'AI'}[k]
-            calls  = sum(r['calls'] for r in daily['all']) if k == 'all' else 0
+            calls  = sum(op.get('calls', 0) or 0 for op in site_ops) if k != 'all' else sum(r['calls'] for r in daily['all'])
             last   = daily[k][-1] if daily[k] else {}
             jinjer = {
                 'all':      sum(site_labor.values()),
@@ -374,7 +374,8 @@ def update():
         # ============================================================
         # ヒートマップ
         # ============================================================
-        heatmap = _calc_heatmap(df_apo, biz_dates, sites['all']['sales'], kono_excluded)
+        heatmap = _calc_heatmap(df_apo, biz_dates, sites['all']['sales'],
+                                kono_excluded, id_site_map, site_label)
 
         # operatorsは既にunit計算で使用した_ops_for_unitを流用（重複計算を避ける）
         operators = _ops_for_unit
@@ -863,30 +864,49 @@ def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num,
     return result
 
 
-def _calc_heatmap(df_apo, biz_dates, total_sales, kono_excluded=True):
+def _calc_heatmap(df_apo, biz_dates, total_sales, kono_excluded=True,
+                  site_map=None, site_label=None):
+    """案件別売上TOP10。サイト別も生成する。"""
     kono_filter = (df_apo['スタッフ名'] != KONO) if kono_excluded else pd.Series([True]*len(df_apo), index=df_apo.index)
-    df_g = df_apo[
-        df_apo['取得日'].isin(biz_dates) &
-        kono_filter
-    ].copy()
-    df_c = df_apo[
-        df_apo['cancel_date_str'].isin(biz_dates) &
-        kono_filter
-    ].copy()
-    pg = df_g.groupby('登録案件名').agg(
-        apo=('アポイントID', 'count'), sg=('sales', 'sum')).reset_index()
-    pc = df_c.groupby('登録案件名').agg(
-        cxl=('アポイントID', 'count'), sc=('sales', 'sum')).reset_index()
-    proj = pg.merge(pc, on='登録案件名', how='left').fillna(0)
-    proj['valid'] = (proj['apo'] - proj['cxl']).astype(int)
-    proj['net']   = (proj['sg']  - proj['sc']).astype(int)
-    proj = proj[proj['valid'] > 0].sort_values('net', ascending=False).head(10)
-    return [
-        {'rank': i + 1, 'name': str(r['登録案件名']),
-         'valid': int(r['valid']), 'sales': int(r['net']),
-         'pct': round(r['net'] / total_sales * 100, 1) if total_sales > 0 else 0}
-        for i, (_, r) in enumerate(proj.iterrows())
-    ]
+    df_g = df_apo[df_apo['取得日'].isin(biz_dates) & kono_filter].copy()
+    df_c = df_apo[df_apo['cancel_date_str'].isin(biz_dates) & kono_filter].copy()
+
+    def _top10(dg, dc, ts):
+        pg = dg.groupby('登録案件名').agg(
+            apo=('アポイントID','count'), sg=('sales','sum')).reset_index()
+        pc = dc.groupby('登録案件名').agg(
+            cxl=('アポイントID','count'), sc=('sales','sum')).reset_index()
+        proj = pg.merge(pc, on='登録案件名', how='left').fillna(0)
+        proj['valid'] = (proj['apo'] - proj['cxl']).astype(int)
+        proj['net']   = (proj['sg']  - proj['sc']).astype(int)
+        proj = proj[proj['valid'] > 0].sort_values('net', ascending=False).head(10)
+        return [
+            {'rank': i+1, 'name': str(r['登録案件名']),
+             'valid': int(r['valid']), 'sales': int(r['net']),
+             'pct': round(r['net'] / ts * 100, 1) if ts > 0 else 0}
+            for i, (_, r) in enumerate(proj.iterrows())
+        ]
+
+    result = {'all': _top10(df_g, df_c, total_sales)}
+
+    # サイト別
+    if site_map and site_label:
+        df_g['site_raw'] = df_g['社員番号'].map(
+            {k: v for k, v in site_map.items()}).fillna(
+            df_g['スタッフ名'].map({k: v for k, v in site_map.items()}))
+        df_c['site_raw'] = df_c['社員番号'].map(
+            {k: v for k, v in site_map.items()}).fillna(
+            df_c['スタッフ名'].map({k: v for k, v in site_map.items()}))
+        for key, raw in [('shinjuku','新宿SC'), ('remote','在宅G'), ('ai','AI')]:
+            dg_s = df_g[df_g['site_raw'] == raw]
+            dc_s = df_c[df_c['site_raw'] == raw]
+            ts_s = int(dg_s['sales'].sum()) - int(dc_s['sales'].sum())
+            result[key] = _top10(dg_s, dc_s, ts_s)
+    else:
+        for key in ['shinjuku', 'remote', 'ai']:
+            result[key] = result['all']
+
+    return result
 
 
 def _calc_operators(df_apo, biz_dates, df_master, df_prod,
