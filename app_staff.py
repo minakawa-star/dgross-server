@@ -42,7 +42,7 @@ def register_staff_routes(app):
                 return jsonify({"error": "データがありません"}), 400
             for r in records:
                 r["target_month"] = r["call_date"][:7] + "-01" if r.get("call_date") else None
-            supabase_staff.table("productivity").upsert(records).execute()
+            supabase_staff.table("productivity").upsert(records, on_conflict="staff_id,call_date").execute()
             return jsonify({"status": "ok", "count": len(records)})
         except Exception as e:
             import traceback
@@ -57,7 +57,7 @@ def register_staff_routes(app):
                 return jsonify({"error": "データがありません"}), 400
             for r in records:
                 r["target_month"] = r["work_date"][:7] + "-01" if r.get("work_date") else None
-            supabase_staff.table("attendance").upsert(records).execute()
+            supabase_staff.table("attendance").upsert(records, on_conflict="staff_id,work_date").execute()
             return jsonify({"status": "ok", "count": len(records)})
         except Exception as e:
             import traceback
