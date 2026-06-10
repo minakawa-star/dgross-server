@@ -117,32 +117,43 @@ def register_staff_routes(app):
     def health_staff():
         return jsonify({"status": "ok", "service": "staff-dashboard"})
 
+    @app.route("/staff/init_admin")
+    def init_admin():
+        try:
+            password = "Dghojin2026"
+            password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+            supabase_staff.table("staff_master").upsert({
+                "staff_id": "ADMIN001",
+                "staff_name": "管理者",
+                "login_id": "admin",
+                "password_hash": password_hash,
+                "role": "admin"
+            }).execute()
+            return jsonify({"status": "ok", "message": "管理者アカウントを作成しました"})
+        except Exception as e:
+            import traceback
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
     @app.route("/staff/login", methods=["POST"])
     def staff_login():
         try:
             data = request.get_json()
             login_id = data.get("login_id", "").strip()
             password = data.get("password", "").strip()
-
             if not login_id or not password:
                 return jsonify({"error": "IDとパスワードを入力してください"}), 400
-
             res = supabase_staff.table("staff_master")\
                 .select("*").eq("login_id", login_id).execute()
-
             if not res.data:
                 return jsonify({"error": "IDまたはパスワードが間違っています"}), 401
-
             staff = res.data[0]
             if not bcrypt.checkpw(password.encode(), staff["password_hash"].encode()):
                 return jsonify({"error": "IDまたはパスワードが間違っています"}), 401
-
             token = jwt.encode({
                 "staff_id": staff["staff_id"],
                 "role": staff["role"],
                 "exp": datetime.datetime.utcnow() + datetime.timedelta(days=30)
             }, JWT_SECRET, algorithm="HS256")
-
             return jsonify({
                 "status": "ok",
                 "token": token,
@@ -150,7 +161,6 @@ def register_staff_routes(app):
                 "role": staff["role"],
                 "name": staff["staff_name"]
             })
-
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
@@ -165,12 +175,9 @@ def register_staff_routes(app):
             login_id = data.get("login_id", "").strip()
             password = data.get("password", "").strip()
             role = data.get("role", "staff")
-
             if not all([staff_id, staff_name, login_id, password]):
                 return jsonify({"error": "必須項目が不足しています"}), 400
-
             password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-
             supabase_staff.table("staff_master").upsert({
                 "staff_id": staff_id,
                 "staff_name": staff_name,
@@ -178,9 +185,7 @@ def register_staff_routes(app):
                 "password_hash": password_hash,
                 "role": role
             }).execute()
-
             return jsonify({"status": "ok", "staff_id": staff_id})
-
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
@@ -193,149 +198,4 @@ def register_staff_routes(app):
                 .select("staff_id,staff_name,role")\
                 .eq("staff_id", request.staff_id).execute()
             if not res.data:
-                return jsonify({"error": "スタッフが見つかりません"}), 404
-            return jsonify({"status": "ok", "data": res.data[0]})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    @app.route("/staff/debug_master")
-    def debug_master():
-        try:
-            master = load_staff_master()
-            targets = ["B0000002", "B0000032", "D0000295", "D0000326", "D0001221", "D0001316"]
-            result = {k: v for k, v in master.items() if k in targets}
-            return jsonify(result)
-        except Exception as e:
-            import traceback
-            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-    @app.route("/staff/summary")
-    def staff_summary():
-        try:
-            month = request.args.get("month")
-            if not month:
-                return jsonify({"error": "monthパラメータが必要です"}), 400
-
-            target_month = month + "-01"
-            master = load_staff_master()
-
-            apo_res = supabase_staff.table("appointments")\
-                .select("*").eq("target_month", target_month).execute()
-            apo_rows = apo_res.data
-
-            att_res = supabase_staff.table("attendance")\
-                .select("*").eq("target_month", target_month).execute()
-            att_rows = att_res.data
-
-            results = {}
-            for sid, info in master.items():
-                results[sid] = {
-                    "staff_id": sid,
-                    "name": info["name"],
-                    "site": info["site"],
-                    "rank": info["rank"],
-                    "apo_amount": 0,
-                    "cxl_amount": 0,
-                    "fb_amount": 0,
-                    "sales": 0,
-                    "work_days": 0,
-                    "target_achieve": 0,
-                    "target_maintain": 0,
-                    "achieve_rate": None,
-                    "is_monthly": info["monthly_salary"] is not None
-                }
-
-            for row in apo_rows:
-                sid = B_TO_D.get(row["staff_id"], row["staff_id"])
-                if sid not in results:
-                    continue
-                cancel = str(row.get("cancel_date") or "")
-                if "考慮" in cancel:
-                    continue
-                if cancel and cancel not in ["None", ""]:
-                    results[sid]["cxl_amount"] += row.get("amount", 0)
-                else:
-                    results[sid]["apo_amount"] += row.get("amount", 0)
-                results[sid]["fb_amount"] += row.get("fb_amount", 0)
-
-            for row in att_rows:
-                sid = B_TO_D.get(row["staff_id"], row["staff_id"])
-                if sid not in results:
-                    continue
-                if (row.get("work_hours") or 0) > 0:
-                    results[sid]["work_days"] += 1
-
-            for sid, r in results.items():
-                info = master[sid]
-                r["sales"] = r["apo_amount"] - r["cxl_amount"] + r["fb_amount"]
-
-                if info["monthly_salary"] is not None:
-                    base = info["monthly_salary"] * 1.15 + 20000
-                    r["target_achieve"] = int(base / 0.40)
-                    r["target_maintain"] = int(base / 0.45)
-                    if r["work_days"] == 0:
-                        r["work_days"] = 22
-                else:
-                    wage = info["hourly_wage"]
-                    mgmt = info["mgmt_fee"]
-                    pattern = info["work_pattern"]
-                    days = r["work_days"]
-                    rate_row = RATE_TABLE.get(pattern, {}).get(days)
-                    if rate_row:
-                        base = wage * 8 + 1000 + mgmt
-                        r["target_achieve"] = int(base * days * rate_row[0])
-                        r["target_maintain"] = int(base * days * rate_row[1])
-
-                if r["target_achieve"] > 0:
-                    r["achieve_rate"] = round(r["sales"] / r["target_achieve"] * 100, 1)
-
-            return jsonify({"status": "ok", "data": list(results.values())})
-
-        except Exception as e:
-            import traceback
-            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-    @app.route("/staff/upload/appointments_json", methods=["POST"])
-    def upload_appointments_json():
-        try:
-            data = request.get_json()
-            records = data.get("records", [])
-            if not records:
-                return jsonify({"error": "データがありません"}), 400
-            for r in records:
-                r["target_month"] = r["acquired_date"][:7] + "-01" if r.get("acquired_date") else None
-            supabase_staff.table("appointments").upsert(records, on_conflict="appointment_id").execute()
-            return jsonify({"status": "ok", "count": len(records)})
-        except Exception as e:
-            import traceback
-            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-    @app.route("/staff/upload/productivity_json", methods=["POST"])
-    def upload_productivity_json():
-        try:
-            data = request.get_json()
-            records = data.get("records", [])
-            if not records:
-                return jsonify({"error": "データがありません"}), 400
-            for r in records:
-                r["target_month"] = r["call_date"][:7] + "-01" if r.get("call_date") else None
-            supabase_staff.table("productivity").upsert(records, on_conflict="staff_id,call_date").execute()
-            return jsonify({"status": "ok", "count": len(records)})
-        except Exception as e:
-            import traceback
-            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-
-    @app.route("/staff/upload/attendance_json", methods=["POST"])
-    def upload_attendance_json():
-        try:
-            data = request.get_json()
-            records = data.get("records", [])
-            if not records:
-                return jsonify({"error": "データがありません"}), 400
-            for r in records:
-                r["target_month"] = r["work_date"][:7] + "-01" if r.get("work_date") else None
-            supabase_staff.table("attendance").upsert(records, on_conflict="staff_id,work_date").execute()
-            return jsonify({"status": "ok", "count": len(records)})
-        except Exception as e:
-            import traceback
-            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+                return js
