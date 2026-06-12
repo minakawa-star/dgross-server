@@ -235,8 +235,6 @@ def register_staff_routes(app):
                 if sid not in results:
                     continue
                 cancel = str(row.get("cancel_date") or "")
-                if "考慮" in cancel:
-                    continue
                 if cancel and cancel not in ["None", ""]:
                     results[sid]["cxl_amount"] += row.get("amount", 0)
                 else:
