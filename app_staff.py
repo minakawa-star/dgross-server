@@ -777,8 +777,8 @@ def register_staff_routes(app):
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-@app.route("/staff/upload/attendance_json", methods=["POST"])
-    def upload_attendance_json():
+　　　　@app.route("/staff/upload/attendance_json", methods=["POST"])
+   　　 def upload_attendance_json():
         try:
             data = request.get_json()
             records = data.get("records", [])
