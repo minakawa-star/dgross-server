@@ -793,14 +793,7 @@ def register_staff_routes(app):
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
             records = data.get("records", [])
             if not records:
-                return jsonify({"error": "データがありません"}), 400
-            for r in records:
-                r["target_month"] = r["work_date"][:7] + "-01" if r.get("work_date") else None
-            supabase_staff.table("attendance").upsert(records, on_conflict="staff_id,work_date").execute()
-            return jsonify({"status": "ok", "count": len(records)})
-        except Exception as e:
-            import traceback
-            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+                
     @app.route("/staff/upload/fb_bulk_json", methods=["POST"])
     @admin_required
     def upload_fb_bulk_json():
