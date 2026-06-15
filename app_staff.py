@@ -791,8 +791,6 @@ def register_staff_routes(app):
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
-            records = data.get("records", [])
-            if not records:
                 
     @app.route("/staff/upload/fb_bulk_json", methods=["POST"])
     @admin_required
