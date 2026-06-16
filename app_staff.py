@@ -958,3 +958,52 @@ def register_staff_routes(app):
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+    @app.route("/staff/daily_calendar")
+    def staff_daily_calendar():
+        """
+        個人ページのカレンダー表示用。
+        指定スタッフ・指定月の、日付ごとのアポ金額・キャンセル金額を返す。
+        """
+        try:
+            staff_id = request.args.get("staff_id")
+            month = request.args.get("month")
+            if not staff_id or not month:
+                return jsonify({"error": "staff_idとmonthが必要です"}), 400
+
+            target_month = month + "-01"
+
+            apo_res = supabase_staff.table("appointments")\
+                .select("*").eq("target_month", target_month).execute()
+            apo_rows = apo_res.data
+
+            daily = {}
+            for row in apo_rows:
+                sid = B_TO_D.get(row["staff_id"], row["staff_id"])
+                if sid != staff_id:
+                    continue
+                day = row.get("appointment_date")
+                if not day:
+                    continue
+                if day not in daily:
+                    daily[day] = {"apo_amount": 0, "cxl_amount": 0}
+                cancel = str(row.get("cancel_date") or "")
+                amount = row.get("achievement_amount", 0)
+                if cancel and cancel not in ["None", ""]:
+                    daily[day]["cxl_amount"] += amount
+                else:
+                    daily[day]["apo_amount"] += amount
+
+            result = []
+            for day, vals in sorted(daily.items()):
+                result.append({
+                    "date": day,
+                    "apo_amount": vals["apo_amount"],
+                    "cxl_amount": vals["cxl_amount"],
+                    "net_amount": vals["apo_amount"] - vals["cxl_amount"]
+                })
+
+            return jsonify({"status": "ok", "data": result})
+        except Exception as e:
+            import traceback
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
