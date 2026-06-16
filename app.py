@@ -35,8 +35,8 @@ CORS(app)
 # 定数
 # ============================================================
 SITE_LABEL  = {'新宿SC': '新宿SC', '在宅G': 'リモートSC', 'AI': 'AI'}
-# 6月以降用（新宿SC→六本木SC）
-SITE_LABEL_JUNE = {'新宿SC': '六本木SC', '在宅G': 'リモートSC', 'AI': 'AI'}
+# 6月以降用：マスターのサイト列が「現場G」に変更（表示名は六本木SC）
+SITE_LABEL_JUNE = {'現場G': '六本木SC', '在宅G': 'リモートSC', 'AI': 'AI'}
 B_TO_D      = {'B0000106': 'D0000295', 'B0000107': 'D0000326', 'D0001318': 'B0000095'}
 KONO        = '幸野有希子CRM'   # 全体/サイト集計から除外
 EXCLUDE_OPS = ['堀川璃歩']      # 全集計から除外
@@ -299,20 +299,25 @@ def update():
             calls_by_date[d] = int(df_prod[mask]['コール数'].sum()) if mask.any() else 0
             ops_by_date[d]   = int(df_prod[mask][agent_col].nunique()) if (mask.any() and agent_col) else 0
 
+        # マスターのサイト列の生値（5月=新宿SC, 6月以降=現場G）
+        gemba_raw = '現場G' if target_month >= 6 else '新宿SC'
+
         # ============================================================
         # 日次明細
         # ============================================================
         daily = {'all': [], 'shinjuku': [], 'remote': [], 'ai': []}
         for i, date_str in enumerate(biz_dates, 1):
             d = _calc_daily(df_apo, date_str, site_map,
-                            calls_by_date, ops_by_date, i, kono_excluded, id_site_map)
+                            calls_by_date, ops_by_date, i, kono_excluded, id_site_map, gemba_raw)
             for key in ['all', 'shinjuku', 'remote', 'ai']:
                 daily[key].append(d[key])
 
         # ============================================================
         # サイト別累計
         # ============================================================
-        shinjuku_label = site_label.get('新宿SC', '新宿SC')  # 5月=新宿SC, 6月=六本木SC
+        # 表示名取得：5月は「新宿SC」キー、6月以降は「現場G」キーから引く
+        site_key_for_label = '現場G' if target_month >= 6 else '新宿SC'
+        shinjuku_label = site_label.get(site_key_for_label, '新宿SC')  # 5月=新宿SC, 6月=六本木SC
         inc_site = {shinjuku_label: 0, 'リモートSC': 0, 'AI': 0}
         for name, inc_total in inc_map.items():
             if inc_total <= 0:
@@ -381,7 +386,7 @@ def update():
         # ヒートマップ
         # ============================================================
         heatmap = _calc_heatmap(df_apo, biz_dates, sites['all']['sales'],
-                                kono_excluded, id_site_map, site_label)
+                                kono_excluded, id_site_map, site_label, gemba_raw)
 
         # operatorsは既にunit計算で使用した_ops_for_unitを流用（重複計算を避ける）
         operators = _ops_for_unit
@@ -479,8 +484,8 @@ def update():
                 return round(site_labor_val / elapsed) if elapsed > 0 else 0
             return total
 
-        # daily各サイトの各行にdaily_laborを付与
-        site_raw_map = {'all': None, 'shinjuku': '新宿SC', 'remote': '在宅G', 'ai': 'AI'}
+        # daily各サイトの各行にdaily_laborを付与（マスター生値は月で切替：5月=新宿SC, 6月以降=現場G）
+        site_raw_map = {'all': None, 'shinjuku': gemba_raw, 'remote': '在宅G', 'ai': 'AI'}
         for site_key_d, raw in site_raw_map.items():
             for row in daily[site_key_d]:
                 row['daily_labor'] = _daily_total_labor(row['date'], raw)
@@ -806,7 +811,8 @@ def _calc_labor(df_work, df_master, df_wage, master_ids, working, site_label=Non
 
     # 【修正】月給制は出勤日数>0のみで稼働判定、時給制は従来通り
     # まず全行をループして月給/時給で条件分岐
-    shinjuku_key = site_label.get('新宿SC', '新宿SC')
+    # site_labelの値（表示名）から「六本木SC/新宿SC」を取得（キーがどちらでも対応）
+    shinjuku_key = next((v for v in site_label.values() if v in ('新宿SC', '六本木SC')), '新宿SC')
     site_labor  = {shinjuku_key: 0, 'リモートSC': 0, 'AI': 0}
     work_by_id  = {}
     labor_by_id = {}
@@ -847,7 +853,7 @@ def _calc_labor(df_work, df_master, df_wage, master_ids, working, site_label=Non
 
 
 def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num,
-                kono_excluded=True, id_site_map=None):
+                kono_excluded=True, id_site_map=None, gemba_raw='新宿SC'):
     """1営業日分の集計。社員番号ベースでサイトを判定。"""
     kono_filter = (df_apo['スタッフ名'] != KONO) if kono_excluded else pd.Series([True]*len(df_apo), index=df_apo.index)
     df_g = df_apo[
@@ -884,7 +890,7 @@ def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num,
     max_valid = top_projects[0]['valid'] if top_projects else 1
 
     result = {}
-    for key, raw in [('all', None), ('shinjuku', '新宿SC'),
+    for key, raw in [('all', None), ('shinjuku', gemba_raw),
                      ('remote', '在宅G'), ('ai', 'AI')]:
         # スタッフのサイト（マスターベース）でフィルタ
         g = df_g if raw is None else df_g[df_g['site_raw'] == raw]
@@ -908,7 +914,7 @@ def _calc_daily(df_apo, date_str, site_map, calls_by_date, ops_by_date, day_num,
 
 
 def _calc_heatmap(df_apo, biz_dates, total_sales, kono_excluded=True,
-                  site_map=None, site_label=None):
+                  site_map=None, site_label=None, gemba_raw='新宿SC'):
     """案件別売上TOP10。サイト別も生成する。"""
     kono_filter = (df_apo['スタッフ名'] != KONO) if kono_excluded else pd.Series([True]*len(df_apo), index=df_apo.index)
     df_g = df_apo[df_apo['取得日'].isin(biz_dates) & kono_filter].copy()
@@ -940,7 +946,7 @@ def _calc_heatmap(df_apo, biz_dates, total_sales, kono_excluded=True,
         df_c['site_raw'] = df_c['社員番号'].map(
             {k: v for k, v in site_map.items()}).fillna(
             df_c['スタッフ名'].map({k: v for k, v in site_map.items()}))
-        for key, raw in [('shinjuku','新宿SC'), ('remote','在宅G'), ('ai','AI')]:
+        for key, raw in [('shinjuku', gemba_raw), ('remote','在宅G'), ('ai','AI')]:
             dg_s = df_g[df_g['site_raw'] == raw]
             dc_s = df_c[df_c['site_raw'] == raw]
             ts_s = int(dg_s['sales'].sum()) - int(dc_s['sales'].sum())
