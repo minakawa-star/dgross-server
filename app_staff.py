@@ -752,7 +752,12 @@ def register_staff_routes(app):
                     results[sid]["cxl_amount"] += row.get("achievement_amount", 0)
                 else:
                     results[sid]["apo_amount"] += row.get("achievement_amount", 0)
-                results[sid]["fb_achievement"] += row.get("fb_amount", 0)
+                if r["fb_achievement"] > 0:
+    r["fb_breakdown"].append({
+        "name": "達成評価FB",
+        "category": "達成評価",
+        "amount": r["fb_achievement"]
+    })
 
             for row in att_rows:
                 sid = B_TO_D.get(row["staff_id"], row["staff_id"])
