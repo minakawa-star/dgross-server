@@ -273,7 +273,8 @@ def calc_campaign_fb(apo_rows, campaigns, bulk_amounts=None):
                     "amount": amount
                 })
                 totals[sid_m] = totals.get(sid_m, 0) + amount
-        else:  # per_unit
+        else:  # per_unit / 指定案件(project_id絞り込み対応)
+            target_project_ids = c.get("target_project_ids") or []
             counts = {}
             for row in apo_rows:
                 acq = row.get("acquired_date")
@@ -282,6 +283,8 @@ def calc_campaign_fb(apo_rows, campaigns, bulk_amounts=None):
                 if not (start <= acq <= end):
                     continue
                 if target_types and row.get("apo_type") not in target_types:
+                    continue
+                if target_project_ids and row.get("project_id") not in target_project_ids:
                     continue
                 if exclude_resend and row.get("resend_status") == "再送":
                     continue
@@ -535,7 +538,8 @@ def register_staff_routes(app):
                     "amount": int(data["amount"]),
                     "target_types": data.get("target_types") or [],
                     "exclude_resend": data.get("exclude_resend", True),
-                    "target_staff_ids": data.get("target_staff_ids") or []
+                    "target_staff_ids": data.get("target_staff_ids") or [],
+                    "target_project_ids": data.get("target_project_ids") or []
                 }
                 res = supabase_staff.table("fb_campaigns").insert(record).execute()
                 return jsonify({"status": "ok", "data": res.data[0]})
@@ -570,7 +574,8 @@ def register_staff_routes(app):
                     "amount": int(data["amount"]),
                     "target_types": data.get("target_types") or [],
                     "exclude_resend": data.get("exclude_resend", True),
-                    "target_staff_ids": data.get("target_staff_ids") or []
+                    "target_staff_ids": data.get("target_staff_ids") or [],
+                    "target_project_ids": data.get("target_project_ids") or []
                 }
                 supabase_staff.table("fb_campaigns").update(record).eq("id", campaign_id).execute()
                 return jsonify({"status": "ok"})
