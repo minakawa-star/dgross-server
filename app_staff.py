@@ -277,7 +277,7 @@ def calc_campaign_fb(apo_rows, campaigns, bulk_amounts=None):
             target_project_ids = c.get("target_project_ids") or []
             counts = {}
             for row in apo_rows:
-                acq = row.get("acquired_date")
+                acq = row.get("appointment_date")
                 if not acq or not start or not end:
                     continue
                 if not (start <= acq <= end):
@@ -872,7 +872,7 @@ def register_staff_routes(app):
             if not records:
                 return jsonify({"error": "データがありません"}), 400
             for r in records:
-                r["target_month"] = r["acquired_date"][:7] + "-01" if r.get("acquired_date") else None
+                r["target_month"] = r["appointment_date"][:7] + "-01" if r.get("appointment_date") else None
             supabase_staff.table("appointments").upsert(records, on_conflict="appointment_id").execute()
             return jsonify({"status": "ok", "count": len(records)})
         except Exception as e:
