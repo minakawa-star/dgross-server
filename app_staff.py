@@ -762,14 +762,6 @@ def register_staff_routes(app):
             for sid, r in results.items():
                 info = master[sid]
 
-                # FB内訳：達成評価分
-                if r["fb_achievement"] > 0:
-                    r["fb_breakdown"].append({
-                        "name": "達成評価FB",
-                        "category": "達成評価",
-                        "amount": r["fb_achievement"]
-                    })
-
                 # FB内訳：キャンペーン分
                 for entry in campaign_breakdown.get(sid, []):
                     r["fb_breakdown"].append(entry)
