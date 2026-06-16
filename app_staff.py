@@ -673,11 +673,13 @@ def register_staff_routes(app):
             bulk_res = supabase_staff.table("fb_bulk_amounts").select("*").execute()
             campaign_breakdown, campaign_totals = calc_campaign_fb(apo_rows, campaigns_res.data, bulk_res.data)
 
+            holidays_res = supabase_staff.table("holidays").select("holiday_date").execute()
+            holidays_set = {h["holiday_date"] for h in holidays_res.data}
+
             # 自動集計FB
             auto_settings_res = supabase_staff.table("fb_auto_settings").select("*").eq("id", 1).execute()
             auto_settings = auto_settings_res.data[0] if auto_settings_res.data else {}
             auto_breakdown, auto_totals = calc_auto_fb(master, apo_rows, att_rows, target_month, holidays_set, auto_settings)
-
             # ---- インセンティブ計算用の事前データ ----
             settings_res = supabase_staff.table("incentive_settings").select("*").eq("id", 1).execute()
             if settings_res.data:
