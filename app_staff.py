@@ -725,7 +725,6 @@ def register_staff_routes(app):
                     "rank": info["rank"],
                     "apo_amount": 0,
                     "cxl_amount": 0,
-                    "fb_achievement": 0,
                     "fb_amount": 0,
                     "fb_breakdown": [],
                     "sales": 0,
