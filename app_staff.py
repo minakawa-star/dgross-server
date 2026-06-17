@@ -43,12 +43,12 @@ RATE_TABLE = {
         7: (2.95, 2.57), 6: (2.95, 2.57), 5: (2.95, 2.57)},
 }
 
-# インセンティブ用：休み日数→売上比重テーブル
+# インセンティブ用：休み日数→売上比重テーブル（週ラベル付き）
 INCENTIVE_RATE_TABLE = [
-    (1, 2.30),   # 休み0-1日 → 週5
-    (4, 2.45),   # 休み2-4日 → 週4
-    (8, 2.60),   # 休み5-8日 → 週3
-    (12, 2.75),  # 休み9-12日 → 週2
+    (1, 2.30, "週5"),   # 休み0-1日 → 週5
+    (4, 2.45, "週4"),   # 休み2-4日 → 週4
+    (8, 2.60, "週3"),   # 休み5-8日 → 週3
+    (12, 2.75, "週2"),  # 休み9-12日 → 週2
 ]
 
 
@@ -759,6 +759,31 @@ def register_staff_routes(app):
                 import traceback
                 return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
+    @app.route("/staff/incentive_payout_rates", methods=["GET", "POST"])
+    @admin_required
+    def incentive_payout_rates():
+        """インセンティブ支給率テーブル（時給帯×週ラベル）の取得・更新"""
+        if request.method == "GET":
+            try:
+                res = supabase_staff.table("incentive_payout_rates").select("*").execute()
+                return jsonify({"status": "ok", "data": res.data})
+            except Exception as e:
+                import traceback
+                return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        else:
+            try:
+                data = request.get_json()
+                rates = data.get("rates", [])
+                # 既存を全削除してから入れ直す（空欄にした項目は対象外として除外されるため）
+                supabase_staff.table("incentive_payout_rates").delete().neq("id", 0).execute()
+                if rates:
+                    rows = [{"wage_band": r["wage_band"], "week_label": r["week_label"], "rate": r["rate"]} for r in rates]
+                    supabase_staff.table("incentive_payout_rates").insert(rows).execute()
+                return jsonify({"status": "ok"})
+            except Exception as e:
+                import traceback
+                return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
     # ============================================================
     # インセンティブ用給与データ（管理本部CSV）アップロード
     # ============================================================
@@ -868,6 +893,52 @@ def register_staff_routes(app):
             py, pm, _ = map(int, prior_month.split("-"))
             prior_business_days = get_business_days(py, pm, holidays_set)
 
+            # 2ヶ月前の売上実績（アポ取得金額－キャンセル金額＋FB）を計算
+            prior_apo_res = supabase_staff.table("appointments")\
+                .select("*").eq("target_month", prior_month).execute()
+            prior_apo_rows = prior_apo_res.data
+
+            prior_sales_map = {}
+            for row in prior_apo_rows:
+                sid = B_TO_D.get(row["staff_id"], row["staff_id"])
+                if sid not in prior_sales_map:
+                    prior_sales_map[sid] = {"apo_amount": 0, "cxl_amount": 0}
+                cancel = str(row.get("cancel_date") or "")
+                amount = row.get("achievement_amount", 0)
+                if cancel and cancel not in ["None", ""]:
+                    prior_sales_map[sid]["cxl_amount"] += amount
+                else:
+                    prior_sales_map[sid]["apo_amount"] += amount
+
+            prior_campaigns_res = supabase_staff.table("fb_campaigns").select("*").execute()
+            prior_campaigns = prior_campaigns_res.data
+            prior_campaign_breakdown, prior_campaign_totals = calc_campaign_fb(prior_apo_rows, prior_campaigns, bulk_res.data)
+
+            prior_auto_settings_res = supabase_staff.table("fb_auto_settings").select("*").eq("id", 1).execute()
+            prior_auto_settings = prior_auto_settings_res.data[0] if prior_auto_settings_res.data else {}
+            prior_adj_res = supabase_staff.table("fb_penalty_adjustments")\
+                .select("*").eq("target_month", prior_month).execute()
+            prior_penalty_adjustments = {a["staff_id"]: a["amount"] for a in prior_adj_res.data}
+            prior_auto_breakdown, prior_auto_totals = calc_auto_fb(
+                master, prior_apo_rows, prior_att_res.data, prior_month, holidays_set,
+                prior_auto_settings, prior_penalty_adjustments
+            )
+
+            prior_fb_totals = {}
+            for sid in set(list(prior_campaign_totals.keys()) + list(prior_auto_totals.keys())):
+                prior_fb_totals[sid] = prior_campaign_totals.get(sid, 0) + prior_auto_totals.get(sid, 0)
+
+            prior_sales_actual_map = {}
+            for sid, vals in prior_sales_map.items():
+                fb = prior_fb_totals.get(sid, 0)
+                prior_sales_actual_map[sid] = vals["apo_amount"] - vals["cxl_amount"] + fb
+
+            # 還元率テーブルの取得
+            payout_rates_res = supabase_staff.table("incentive_payout_rates").select("*").execute()
+            payout_rate_map = {}
+            for r in payout_rates_res.data:
+                payout_rate_map[(r["wage_band"], r["week_label"])] = r["rate"]
+
             # ---- 結果初期化 ----
             results = {}
             for sid, info in master.items():
@@ -962,6 +1033,23 @@ def register_staff_routes(app):
                 if r["target_achieve"] > 0:
                     r["achieve_rate"] = round(r["sales"] / r["target_achieve"] * 100, 1)
 
+                # ---- 確定時給（暫定ロジック） ----
+                # 達成目標以上→時給+100円、維持目標以上達成未満→変動なし、維持目標未満→時給-100円
+                if info["monthly_salary"] is None and r["target_achieve"] > 0 and r["target_maintain"] > 0:
+                    current_wage = info["hourly_wage"]
+                    if r["sales"] >= r["target_achieve"]:
+                        r["confirmed_wage"] = current_wage + 100
+                        r["confirmed_wage_change"] = "+100円（達成）"
+                    elif r["sales"] >= r["target_maintain"]:
+                        r["confirmed_wage"] = current_wage
+                        r["confirmed_wage_change"] = "変動なし（維持）"
+                    else:
+                        r["confirmed_wage"] = current_wage - 100
+                        r["confirmed_wage_change"] = "-100円（未達）"
+                else:
+                    r["confirmed_wage"] = None
+                    r["confirmed_wage_change"] = None
+
                 # ---- インセンティブ目標 ----
                 # ロジック: (基本給 + 残業手当 + 非課税通勤手当) × 売上比重
                 if info["monthly_salary"] is not None:
@@ -975,9 +1063,11 @@ def register_staff_routes(app):
                         rest_days = prior_business_days - prior_work_days
 
                         rate = None
-                        for max_rest, rate_val in INCENTIVE_RATE_TABLE:
+                        week_label = None
+                        for max_rest, rate_val, label in INCENTIVE_RATE_TABLE:
                             if rest_days <= max_rest:
                                 rate = rate_val
+                                week_label = label
                                 break
 
                         payroll = prior_payroll_map.get(sid)
@@ -1005,6 +1095,36 @@ def register_staff_routes(app):
                                 "commute_allowance": payroll["commute_allowance"],
                                 "payroll_total": payroll_total
                             }
+
+                            # ---- 支給金額（インセンティブ還元額） ----
+                            # ロジック: (目標値 - 2ヶ月前売上実績) × 還元率
+                            prior_sales_actual = prior_sales_actual_map.get(sid, 0)
+                            excess_amount = incentive_target - prior_sales_actual
+
+                            if wage == 2500:
+                                wage_band = "2500"
+                            elif 2100 <= wage <= 2400:
+                                wage_band = "2100-2400"
+                            else:
+                                wage_band = None
+
+                            payout_rate = payout_rate_map.get((wage_band, week_label)) if wage_band else None
+
+                            if excess_amount <= 0:
+                                r["incentive_payout"] = 0
+                                r["incentive_payout_status"] = "対象外（超過なし）"
+                            elif payout_rate is None:
+                                r["incentive_payout"] = None
+                                r["incentive_payout_status"] = "対象外（時給帯・週条件不一致）"
+                            else:
+                                payout = int(excess_amount * payout_rate)
+                                r["incentive_payout"] = payout
+                                r["incentive_payout_status"] = "ok"
+                                r["incentive_detail"]["prior_sales_actual"] = prior_sales_actual
+                                r["incentive_detail"]["excess_amount"] = excess_amount
+                                r["incentive_detail"]["payout_rate"] = payout_rate
+                                r["incentive_detail"]["wage_band"] = wage_band
+                                r["incentive_detail"]["week_label"] = week_label
 
             return jsonify({"status": "ok", "data": list(results.values())})
 
