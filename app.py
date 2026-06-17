@@ -35,8 +35,8 @@ CORS(app)
 # 定数
 # ============================================================
 SITE_LABEL  = {'新宿SC': '新宿SC', '在宅G': 'リモートSC', 'AI': 'AI'}
-# 6月以降用：マスターのサイト列が「現場G」に変更（表示名は六本木SC）
-SITE_LABEL_JUNE = {'現場G': '六本木SC', '在宅G': 'リモートSC', 'AI': 'AI'}
+# 6月以降用（マスター変更完了まで新宿SCキーのまま、表示名のみ六本木SC）
+SITE_LABEL_JUNE = {'新宿SC': '六本木SC', '在宅G': 'リモートSC', 'AI': 'AI'}
 B_TO_D      = {'B0000106': 'D0000295', 'B0000107': 'D0000326', 'D0001318': 'B0000095'}
 KONO        = '幸野有希子CRM'   # 全体/サイト集計から除外
 EXCLUDE_OPS = ['堀川璃歩']      # 全集計から除外
@@ -299,8 +299,8 @@ def update():
             calls_by_date[d] = int(df_prod[mask]['コール数'].sum()) if mask.any() else 0
             ops_by_date[d]   = int(df_prod[mask][agent_col].nunique()) if (mask.any() and agent_col) else 0
 
-        # マスターのサイト列の生値（5月=新宿SC, 6月以降=現場G）
-        gemba_raw = '現場G' if target_month >= 6 else '新宿SC'
+        # マスターのサイト列の生値（マスター変更完了まで新宿SCのまま）
+        gemba_raw = '新宿SC'
 
         # ============================================================
         # 日次明細
@@ -315,8 +315,8 @@ def update():
         # ============================================================
         # サイト別累計
         # ============================================================
-        # 表示名取得：5月は「新宿SC」キー、6月以降は「現場G」キーから引く
-        site_key_for_label = '現場G' if target_month >= 6 else '新宿SC'
+        # 表示名取得：マスター変更完了まで「新宿SC」キーで取得
+        site_key_for_label = '新宿SC'
         shinjuku_label = site_label.get(site_key_for_label, '新宿SC')  # 5月=新宿SC, 6月=六本木SC
         inc_site = {shinjuku_label: 0, 'リモートSC': 0, 'AI': 0}
         for name, inc_total in inc_map.items():
