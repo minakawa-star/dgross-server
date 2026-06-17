@@ -123,15 +123,17 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
-def calc_auto_fb(master, apo_rows, att_rows, target_month, holidays_set, auto_settings):
+def calc_auto_fb(master, apo_rows, att_rows, target_month, holidays_set, auto_settings, penalty_adjustments=None):
     """
     FB自動集計（行動量ボーナス・勤怠ペナルティ）
+    penalty_adjustments: { staff_id: 補正後の最終ペナルティ金額 }（指定があれば自動計算結果を上書き）
     戻り値:
       breakdown: { staff_id: [ {name, category, amount}, ... ] }
       totals:    { staff_id: 合計金額 }
     """
     breakdown = {}
     totals = {}
+    penalty_adjustments = penalty_adjustments or {}
 
     if not auto_settings:
         return breakdown, totals
@@ -219,16 +221,27 @@ def calc_auto_fb(master, apo_rows, att_rows, target_month, holidays_set, auto_se
         })
         totals[sid] = totals.get(sid, 0) + bonus
 
-    # 勤怠ペナルティ
-    for sid, count in penalty_map.items():
+    # 勤怠ペナルティ（補正がある場合は補正額で上書き）
+    all_penalty_staff = set(penalty_map.keys()) | set(penalty_adjustments.keys())
+    for sid in all_penalty_staff:
         if sid not in master:
             continue
-        amount = count * (-penalty_per)
-        breakdown.setdefault(sid, []).append({
-            "name": f"勤怠ペナルティ（{count}回）",
-            "category": "勤怠ペナルティ",
-            "amount": amount
-        })
+        if sid in penalty_adjustments:
+            amount = penalty_adjustments[sid]
+            count = penalty_map.get(sid, 0)
+            breakdown.setdefault(sid, []).append({
+                "name": f"勤怠ペナルティ（{count}回・手動補正済）",
+                "category": "勤怠ペナルティ",
+                "amount": amount
+            })
+        else:
+            count = penalty_map[sid]
+            amount = count * (-penalty_per)
+            breakdown.setdefault(sid, []).append({
+                "name": f"勤怠ペナルティ（{count}回）",
+                "category": "勤怠ペナルティ",
+                "amount": amount
+            })
         totals[sid] = totals.get(sid, 0) + amount
 
     return breakdown, totals
@@ -421,6 +434,54 @@ def register_staff_routes(app):
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+    @app.route("/staff/penalty_adjustments", methods=["GET", "POST"])
+    @admin_required
+    def staff_penalty_adjustments():
+        """勤怠ペナルティの手動補正（合計値で登録/取得）"""
+        try:
+            if request.method == "GET":
+                month = request.args.get("month")
+                if not month:
+                    return jsonify({"error": "monthパラメータが必要です"}), 400
+                target_month = month + "-01"
+                res = supabase_staff.table("fb_penalty_adjustments")\
+                    .select("*").eq("target_month", target_month).execute()
+                return jsonify({"status": "ok", "data": res.data})
+            else:
+                data = request.get_json()
+                staff_id = data.get("staff_id", "").strip()
+                month = data.get("month", "").strip()
+                amount = data.get("amount")
+                reason = data.get("reason", "").strip()
+                if not staff_id or not month or amount is None:
+                    return jsonify({"error": "staff_id, month, amountが必要です"}), 400
+                target_month = month + "-01"
+                supabase_staff.table("fb_penalty_adjustments").upsert({
+                    "staff_id": staff_id,
+                    "target_month": target_month,
+                    "amount": int(amount),
+                    "reason": reason
+                }, on_conflict="staff_id,target_month").execute()
+                return jsonify({"status": "ok"})
+        except Exception as e:
+            import traceback
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+    @app.route("/staff/penalty_adjustments/<staff_id>", methods=["DELETE"])
+    @admin_required
+    def staff_penalty_adjustments_delete(staff_id):
+        """補正の削除（自動計算に戻す）"""
+        try:
+            month = request.args.get("month")
+            if not month:
+                return jsonify({"error": "monthパラメータが必要です"}), 400
+            target_month = month + "-01"
+            supabase_staff.table("fb_penalty_adjustments")\
+                .delete().eq("staff_id", staff_id).eq("target_month", target_month).execute()
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/staff/admin_reset_password", methods=["POST"])
     @admin_required
@@ -721,10 +782,13 @@ def register_staff_routes(app):
             holidays_res = supabase_staff.table("holidays").select("holiday_date").execute()
             holidays_set = {h["holiday_date"] for h in holidays_res.data}
 
-            # 自動集計FB
+            # 自動集計FB（勤怠ペナルティの手動補正を反映）
             auto_settings_res = supabase_staff.table("fb_auto_settings").select("*").eq("id", 1).execute()
             auto_settings = auto_settings_res.data[0] if auto_settings_res.data else {}
-            auto_breakdown, auto_totals = calc_auto_fb(master, apo_rows, att_rows, target_month, holidays_set, auto_settings)
+            adj_res = supabase_staff.table("fb_penalty_adjustments")\
+                .select("*").eq("target_month", target_month).execute()
+            penalty_adjustments = {a["staff_id"]: a["amount"] for a in adj_res.data}
+            auto_breakdown, auto_totals = calc_auto_fb(master, apo_rows, att_rows, target_month, holidays_set, auto_settings, penalty_adjustments)
             # ---- インセンティブ計算用の事前データ ----
             settings_res = supabase_staff.table("incentive_settings").select("*").eq("id", 1).execute()
             if settings_res.data:
