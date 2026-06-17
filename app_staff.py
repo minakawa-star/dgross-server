@@ -574,6 +574,50 @@ def register_staff_routes(app):
                 import traceback
                 return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
+    @app.route("/staff/target/bulk", methods=["POST"])
+    @admin_required
+    def staff_target_bulk():
+        """出勤予定数の一括登録（未入力の人だけ、または全員に同じ値を反映）"""
+        try:
+            data = request.get_json()
+            month = data.get("month")
+            value = data.get("planned_work_days")
+            staff_ids = data.get("staff_ids")  # 指定があればこの人たちだけ、なければ全員
+            only_empty = data.get("only_empty", True)  # Trueなら未入力の人だけ上書き
+
+            if not month or value is None:
+                return jsonify({"error": "month, planned_work_daysが必要です"}), 400
+
+            target_month = month + "-01"
+            master = load_staff_master()
+            target_staff_ids = staff_ids if staff_ids else list(master.keys())
+
+            existing_res = supabase_staff.table("monthly_targets")\
+                .select("*").eq("target_month", target_month).execute()
+            existing_map = {e["staff_id"]: e for e in existing_res.data}
+
+            updated = []
+            skipped = []
+            for sid in target_staff_ids:
+                existing = existing_map.get(sid)
+                if existing and existing.get("is_confirmed"):
+                    skipped.append(sid)
+                    continue
+                if only_empty and existing and existing.get("planned_work_days"):
+                    skipped.append(sid)
+                    continue
+                supabase_staff.table("monthly_targets").upsert({
+                    "staff_id": sid,
+                    "target_month": target_month,
+                    "planned_work_days": int(value)
+                }, on_conflict="staff_id,target_month").execute()
+                updated.append(sid)
+
+            return jsonify({"status": "ok", "updated_count": len(updated), "skipped_count": len(skipped)})
+        except Exception as e:
+            import traceback
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
     @app.route("/staff/confirm_month", methods=["POST"])
     @admin_required
     def confirm_month():
@@ -1067,7 +1111,7 @@ def register_staff_routes(app):
     def staff_daily_calendar():
         """
         個人ページのカレンダー表示用。
-        指定スタッフ・指定月の、日付ごとのアポ金額・キャンセル金額を返す。
+        指定スタッフ・指定月の、日付ごとのアポ金額・キャンセル金額・個別案件一覧を返す。
         """
         try:
             staff_id = request.args.get("staff_id")
@@ -1090,13 +1134,20 @@ def register_staff_routes(app):
                 if not day:
                     continue
                 if day not in daily:
-                    daily[day] = {"apo_amount": 0, "cxl_amount": 0}
+                    daily[day] = {"apo_amount": 0, "cxl_amount": 0, "items": []}
                 cancel = str(row.get("cancel_date") or "")
                 amount = row.get("achievement_amount", 0)
-                if cancel and cancel not in ["None", ""]:
+                project_name = row.get("project_name") or "（案件名未登録）"
+                is_cancel = bool(cancel and cancel not in ["None", ""])
+                if is_cancel:
                     daily[day]["cxl_amount"] += amount
                 else:
                     daily[day]["apo_amount"] += amount
+                daily[day]["items"].append({
+                    "project_name": project_name,
+                    "amount": amount,
+                    "is_cancel": is_cancel
+                })
 
             result = []
             for day, vals in sorted(daily.items()):
@@ -1104,7 +1155,8 @@ def register_staff_routes(app):
                     "date": day,
                     "apo_amount": vals["apo_amount"],
                     "cxl_amount": vals["cxl_amount"],
-                    "net_amount": vals["apo_amount"] - vals["cxl_amount"]
+                    "net_amount": vals["apo_amount"] - vals["cxl_amount"],
+                    "items": vals["items"]
                 })
 
             return jsonify({"status": "ok", "data": result})
