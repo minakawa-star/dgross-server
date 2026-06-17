@@ -762,11 +762,13 @@ def register_staff_routes(app):
     @app.route("/staff/incentive_payout_rates", methods=["GET", "POST"])
     @admin_required
     def incentive_payout_rates():
-        """インセンティブ支給率テーブル（時給帯×週ラベル）の取得・更新"""
+        """インセンティブ支給率テーブル（時給帯×区分）の取得・更新。区分は週勤務 or 達成率のいずれかのモードで運用"""
         if request.method == "GET":
             try:
-                res = supabase_staff.table("incentive_payout_rates").select("*").execute()
-                return jsonify({"status": "ok", "data": res.data})
+                rates_res = supabase_staff.table("incentive_payout_rates").select("*").execute()
+                mode_res = supabase_staff.table("incentive_payout_mode").select("*").eq("id", 1).execute()
+                mode = mode_res.data[0]["mode"] if mode_res.data else "week"
+                return jsonify({"status": "ok", "data": rates_res.data, "mode": mode})
             except Exception as e:
                 import traceback
                 return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
@@ -774,10 +776,22 @@ def register_staff_routes(app):
             try:
                 data = request.get_json()
                 rates = data.get("rates", [])
+                mode = data.get("mode", "week")
+
+                supabase_staff.table("incentive_payout_mode").upsert({"id": 1, "mode": mode}).execute()
+
                 # 既存を全削除してから入れ直す（空欄にした項目は対象外として除外されるため）
                 supabase_staff.table("incentive_payout_rates").delete().neq("id", 0).execute()
                 if rates:
-                    rows = [{"wage_band": r["wage_band"], "week_label": r["week_label"], "rate": r["rate"]} for r in rates]
+                    rows = []
+                    for r in rates:
+                        rows.append({
+                            "wage_band": int(r["wage_band"]),
+                            "segment_label": r["segment_label"],
+                            "segment_min": r.get("segment_min"),
+                            "segment_max": r.get("segment_max"),
+                            "rate": float(r["rate"])
+                        })
                     supabase_staff.table("incentive_payout_rates").insert(rows).execute()
                 return jsonify({"status": "ok"})
             except Exception as e:
@@ -935,9 +949,10 @@ def register_staff_routes(app):
 
             # 還元率テーブルの取得
             payout_rates_res = supabase_staff.table("incentive_payout_rates").select("*").execute()
-            payout_rate_map = {}
-            for r in payout_rates_res.data:
-                payout_rate_map[(r["wage_band"], r["week_label"])] = r["rate"]
+            payout_rate_rows = payout_rates_res.data
+
+            payout_mode_res = supabase_staff.table("incentive_payout_mode").select("*").eq("id", 1).execute()
+            payout_mode = payout_mode_res.data[0]["mode"] if payout_mode_res.data else "week"
 
             # ---- 結果初期化 ----
             results = {}
@@ -1101,21 +1116,39 @@ def register_staff_routes(app):
                             prior_sales_actual = prior_sales_actual_map.get(sid, 0)
                             excess_amount = incentive_target - prior_sales_actual
 
-                            if wage == 2500:
-                                wage_band = "2500"
-                            elif 2100 <= wage <= 2400:
-                                wage_band = "2100-2400"
-                            else:
-                                wage_band = None
+                            # 時給帯に一致する行だけに絞る（ちょうどその時給の人のみ対象）
+                            band_rows = [row for row in payout_rate_rows if row["wage_band"] == wage]
 
-                            payout_rate = payout_rate_map.get((wage_band, week_label)) if wage_band else None
+                            payout_rate = None
+                            matched_segment = None
+                            if payout_mode == "week":
+                                for row in band_rows:
+                                    if row["segment_label"] == week_label:
+                                        payout_rate = row["rate"]
+                                        matched_segment = row["segment_label"]
+                                        break
+                            else:  # achieve_rate モード
+                                if incentive_target > 0:
+                                    achieve_pct = round(prior_sales_actual / incentive_target * 100, 2)
+                                else:
+                                    achieve_pct = 0
+                                for row in band_rows:
+                                    smin = row.get("segment_min")
+                                    smax = row.get("segment_max")
+                                    if smin is not None and smax is not None and smin <= achieve_pct <= smax:
+                                        payout_rate = row["rate"]
+                                        matched_segment = row["segment_label"]
+                                        break
 
                             if excess_amount <= 0:
                                 r["incentive_payout"] = 0
                                 r["incentive_payout_status"] = "対象外（超過なし）"
+                            elif not band_rows:
+                                r["incentive_payout"] = None
+                                r["incentive_payout_status"] = "対象外（時給帯未登録）"
                             elif payout_rate is None:
                                 r["incentive_payout"] = None
-                                r["incentive_payout_status"] = "対象外（時給帯・週条件不一致）"
+                                r["incentive_payout_status"] = "対象外（区分不一致）"
                             else:
                                 payout = int(excess_amount * payout_rate)
                                 r["incentive_payout"] = payout
@@ -1123,8 +1156,8 @@ def register_staff_routes(app):
                                 r["incentive_detail"]["prior_sales_actual"] = prior_sales_actual
                                 r["incentive_detail"]["excess_amount"] = excess_amount
                                 r["incentive_detail"]["payout_rate"] = payout_rate
-                                r["incentive_detail"]["wage_band"] = wage_band
-                                r["incentive_detail"]["week_label"] = week_label
+                                r["incentive_detail"]["payout_mode"] = payout_mode
+                                r["incentive_detail"]["matched_segment"] = matched_segment
 
             return jsonify({"status": "ok", "data": list(results.values())})
 
