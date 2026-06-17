@@ -853,7 +853,7 @@ def register_staff_routes(app):
                 change_mark = "レ" if (next_wage is not None and next_next_wage is not None and next_wage != next_next_wage) else ""
                 if next_wage is None and next_next_wage is None:
                     continue
-                ws.append([sid, info["staff_name"], next_wage, next_next_wage, change_mark])
+                ws.append([sid, info["name"], next_wage, next_next_wage, change_mark])
 
             buf = io.BytesIO()
             wb.save(buf)
