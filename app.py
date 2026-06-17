@@ -161,7 +161,7 @@ def update():
     try:
         # --- ファイル受け取り ---
         for key, label in [('apo','アポイントリスト'),('prod','生産性レポート'),
-                            ('work','勤務データ'),('report','レポート')]:
+                            ('work','勤務データ')]:
             if key not in request.files:
                 return jsonify({'error': f'{label}が見つかりません'}), 400
 
