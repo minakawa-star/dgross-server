@@ -928,7 +928,7 @@ def _calc_heatmap(df_apo, biz_dates, total_sales, kono_excluded=True,
         proj = pg.merge(pc, on='登録案件名', how='left').fillna(0)
         proj['valid'] = (proj['apo'] - proj['cxl']).astype(int)
         proj['net']   = (proj['sg']  - proj['sc']).astype(int)
-        proj = proj[proj['valid'] > 0].sort_values('net', ascending=False).head(10)
+        proj = proj[proj['valid'] > 0].sort_values('net', ascending=False).head(20)
         return [
             {'rank': i+1, 'name': str(r['登録案件名']),
              'valid': int(r['valid']), 'sales': int(r['net']),
@@ -1069,9 +1069,13 @@ def _calc_operators(df_apo, biz_dates, df_master, df_prod,
         proj_m  = g_proj.merge(c_proj, on='登録案件名', how='left').fillna(0)
         proj_m['valid'] = (proj_m['apo'] - proj_m['cxl']).astype(int)
         proj_m['net']   = (proj_m['sales'] - proj_m['sc']).astype(int)
-        proj_m = proj_m[proj_m['valid'] > 0].sort_values('valid', ascending=False).head(10)
+        proj_m = proj_m[proj_m['valid'] > 0].sort_values('valid', ascending=False).head(20)
         projects = [
-            {'name': str(r['登録案件名']), 'valid': int(r['valid']), 'sales': int(r['net'])}
+            {'name': str(r['登録案件名']),
+             'apo':   int(r['apo']),
+             'cxl':   int(r['cxl']),
+             'valid': int(r['valid']),
+             'sales': int(r['net'])}
             for _, r in proj_m.iterrows()
         ]
 
