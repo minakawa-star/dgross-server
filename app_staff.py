@@ -850,7 +850,10 @@ def register_staff_routes(app):
                 cur = cur_history_map.get(sid)
                 next_wage = prev["confirmed_wage"] if prev else None
                 next_next_wage = cur["confirmed_wage"] if cur else None
-                change_mark = "レ" if (next_wage is not None and next_next_wage is not None and next_wage != next_next_wage) else ""
+                if next_wage is not None and next_next_wage is not None and next_wage != next_next_wage:
+                    change_mark = "昇給" if next_next_wage > next_wage else "降給"
+                else:
+                    change_mark = ""
                 if next_wage is None and next_next_wage is None:
                     continue
                 ws.append([sid, info["name"], next_wage, next_next_wage, change_mark])
