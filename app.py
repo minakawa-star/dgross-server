@@ -240,9 +240,17 @@ def update():
                          f'最新のアポリスト（当月含む過去3ヶ月分）をアップしてください。'
             }), 400
 
-        # 6月以降は新宿SC→六本木SCに表示変更
+        # サイトマッピング：prev_jsonに保存済みがあればそれを使用、なければデフォルト
         kono_excluded = target_month < 6
-        site_label = SITE_LABEL_JUNE if target_month >= 6 else SITE_LABEL
+        saved_mapping = prev_json.get('siteMapping', [])
+        if saved_mapping:
+            # ダッシュボードで設定されたマッピングを使用
+            site_label = {m['raw']: m['label'] for m in saved_mapping if m.get('raw') and m.get('label')}
+            include_set = {m['label'] for m in saved_mapping if m.get('include', True) and m.get('label')}
+        else:
+            # デフォルト（コードのSITE_LABEL）
+            site_label  = SITE_LABEL_JUNE if target_month >= 6 else SITE_LABEL
+            include_set = {'六本木SC', 'リモートSC'} if target_month >= 6 else {'新宿SC', 'リモートSC'}
 
         # ============================================================
         # jinjer勤務データの期間検証
@@ -348,12 +356,10 @@ def update():
             }[k]
             labor = jinjer + (inc_all if k == 'all' else inc_site.get(site_jp, 0))
 
-            # OP個人実績の積み上げ
-            # 全体（all）は六本木SC・リモートSCのみ集計（AI・サイト未所属は除外）
-            valid_sites = {shinjuku_label, 'リモートSC'}
+            # OP個人実績の積み上げ（全体はinclude_setのサイトのみ）
             site_ops = [op for op in _ops_for_unit
                         if k != 'all' and op['site'] == site_jp
-                        or k == 'all' and op['site'] in valid_sites]
+                        or k == 'all' and op['site'] in include_set]
             sales  = sum(op['sales']  for op in site_ops)
             apo    = sum(op['apo']    for op in site_ops)
             cancel = sum(op['cancel'] for op in site_ops)
@@ -626,6 +632,9 @@ def update():
             'operators': operators,
             'incentive': inc_map,
             'prev_calls': {op['name']: op['calls'] for op in operators},
+            'siteMapping': saved_mapping if saved_mapping else [],
+            'additionalRevenues': prev_json.get('additionalRevenues', []),
+            'additionalTotal':    prev_json.get('additionalTotal', 0),
         }
 
         # 検証
