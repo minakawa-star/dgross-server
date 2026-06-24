@@ -1484,10 +1484,31 @@ def register_staff_routes(app):
             records = data.get("records", [])
             if not records:
                 return jsonify({"error": "データがありません"}), 400
+
+            # target_monthを設定し、月ごとにグループ化
             for r in records:
                 r["target_month"] = r["appointment_date"][:7] + "-01" if r.get("appointment_date") else None
-            supabase_staff.table("appointments").upsert(records, on_conflict="appointment_id").execute()
-            return jsonify({"status": "ok", "count": len(records)})
+
+            # アップロードデータに含まれる月の一覧を取得
+            months_in_data = set(r["target_month"] for r in records if r.get("target_month"))
+
+            # スタッフIDの一覧も取得（スタッフ単位で削除することで他スタッフに影響しない）
+            staff_ids_in_data = set(r["staff_id"] for r in records if r.get("staff_id"))
+
+            # 対象月×対象スタッフの既存データを全削除してから再挿入
+            for month in months_in_data:
+                for staff_id in staff_ids_in_data:
+                    supabase_staff.table("appointments")\
+                        .delete()\
+                        .eq("target_month", month)\
+                        .eq("staff_id", staff_id)\
+                        .execute()
+
+            # 全件挿入（upsertではなくinsertで重複なく入れる）
+            if records:
+                supabase_staff.table("appointments").insert(records).execute()
+
+            return jsonify({"status": "ok", "count": len(records), "months": sorted(months_in_data)})
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
