@@ -1224,10 +1224,11 @@ def register_staff_routes(app):
                 prior_sales_map[sid] = {"apo_amount": 0, "cxl_amount": 0}
             cancel = str(row.get("cancel_date") or "")
             amount = row.get("achievement_amount", 0)
+            # アポ取得＝全件合計（CXL含む）
+            prior_sales_map[sid]["apo_amount"] += amount
+            # CXLは別途集計
             if cancel and cancel not in ["None", ""]:
                 prior_sales_map[sid]["cxl_amount"] += amount
-            else:
-                prior_sales_map[sid]["apo_amount"] += amount
 
         prior_campaigns_res = supabase_staff.table("fb_campaigns").select("*").execute()
         prior_campaigns = prior_campaigns_res.data
@@ -1290,11 +1291,13 @@ def register_staff_routes(app):
             sid = B_TO_D.get(row["staff_id"], row["staff_id"])
             if sid not in results:
                 continue
+            amount = row.get("achievement_amount", 0)
             cancel = str(row.get("cancel_date") or "")
+            # アポ取得＝全件合計（CXL含む）
+            results[sid]["apo_amount"] += amount
+            # CXLは別途集計（売上計算時に引く）
             if cancel and cancel not in ["None", ""]:
-                results[sid]["cxl_amount"] += row.get("achievement_amount", 0)
-            else:
-                results[sid]["apo_amount"] += row.get("achievement_amount", 0)
+                results[sid]["cxl_amount"] += amount
                 
         for row in att_rows:
             sid = B_TO_D.get(row["staff_id"], row["staff_id"])
@@ -1629,10 +1632,10 @@ def register_staff_routes(app):
                 amount = row.get("achievement_amount", 0)
                 project_name = row.get("project_name") or "（案件名未登録）"
                 is_cancel = bool(cancel and cancel not in ["None", ""])
+                # アポ取得＝全件合計（CXL含む）
+                daily[day]["apo_amount"] += amount
                 if is_cancel:
                     daily[day]["cxl_amount"] += amount
-                else:
-                    daily[day]["apo_amount"] += amount
                 daily[day]["items"].append({
                     "project_name": project_name,
                     "amount": amount,
