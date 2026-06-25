@@ -1224,10 +1224,12 @@ def register_staff_routes(app):
                 prior_sales_map[sid] = {"apo_amount": 0, "cxl_amount": 0}
             cancel = str(row.get("cancel_date") or "")
             amount = row.get("achievement_amount", 0)
+            is_cancel = bool(cancel and cancel not in ["None", ""])
+            is_kouryo = "考慮" in cancel
             # アポ取得＝全件合計（CXL含む）
             prior_sales_map[sid]["apo_amount"] += amount
-            # CXLは別途集計
-            if cancel and cancel not in ["None", ""]:
+            # CXLは別途集計（考慮キャンセルは除外）
+            if is_cancel and not is_kouryo:
                 prior_sales_map[sid]["cxl_amount"] += amount
 
         prior_campaigns_res = supabase_staff.table("fb_campaigns").select("*").execute()
@@ -1293,10 +1295,12 @@ def register_staff_routes(app):
                 continue
             amount = row.get("achievement_amount", 0)
             cancel = str(row.get("cancel_date") or "")
+            is_cancel = bool(cancel and cancel not in ["None", ""])
+            is_kouryo = "考慮" in cancel
             # アポ取得＝全件合計（CXL含む）
             results[sid]["apo_amount"] += amount
-            # CXLは別途集計（売上計算時に引く）
-            if cancel and cancel not in ["None", ""]:
+            # CXLは別途集計（考慮キャンセルは除外）
+            if is_cancel and not is_kouryo:
                 results[sid]["cxl_amount"] += amount
                 
         for row in att_rows:
@@ -1632,9 +1636,11 @@ def register_staff_routes(app):
                 amount = row.get("achievement_amount", 0)
                 project_name = row.get("project_name") or "（案件名未登録）"
                 is_cancel = bool(cancel and cancel not in ["None", ""])
+                is_kouryo = "考慮" in cancel
                 # アポ取得＝全件合計（CXL含む）
                 daily[day]["apo_amount"] += amount
-                if is_cancel:
+                # CXLは考慮キャンセルを除外
+                if is_cancel and not is_kouryo:
                     daily[day]["cxl_amount"] += amount
                 daily[day]["items"].append({
                     "project_name": project_name,
