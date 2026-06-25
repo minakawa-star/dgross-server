@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import gc
 # -*- coding: utf-8 -*-
 """
 PT事業部 ダッシュボード更新サーバー v2
@@ -169,6 +170,8 @@ def update():
         prod_file = request.files['prod'].read()
         work_raw  = request.files['work'].read()
         work_file, work_end_date = _extract_work_from_zip(work_raw)
+        del work_raw  # zip展開後すぐ解放
+        gc.collect()
         prev_json = json.loads(request.files['prev'].read().decode('utf-8'))
 
         # スタッフマスター：アップロード優先、なければGitHubから取得
@@ -183,24 +186,31 @@ def update():
 
         # --- マスター読み込み ---
         df_master, df_wage = _load_master(master_file)
+        del master_file  # 読み込み後に解放
+        gc.collect()
         site_map      = dict(zip(df_master['スタッフ名'], df_master['サイト']))
         rank_map      = dict(zip(df_master['スタッフ名'], df_master['ランク']))
         id_map        = dict(zip(df_master['スタッフ名'], df_master['社員番号']))
         master_ids    = set(df_master['社員番号'].tolist())
-        # 社員番号ベースのマッピング（集計の主キーとして使用）
         id_site_map   = dict(zip(df_master['社員番号'], df_master['サイト']))
         id_name_map   = dict(zip(df_master['社員番号'], df_master['スタッフ名']))
 
         # --- アポイントリスト読み込み ---
         df_apo = _load_apo(apo_file)
+        del apo_file  # 読み込み後に解放
+        gc.collect()
 
         # --- 生産性レポート読み込み ---
         df_prod = _load_csv(prod_file)
+        del prod_file  # 読み込み後に解放
+        gc.collect()
 
         # --- 勤務データ読み込み ---
         work_data = _load_work(work_file)
-        df_work   = work_data['df_monthly']   # 月累計（_calc_laborに渡す）
-        df_work_daily = work_data['df_daily'] # 日次（日次人件費計算用）None if monthly
+        del work_file  # 読み込み後に解放
+        gc.collect()
+        df_work   = work_data['df_monthly']
+        df_work_daily = work_data['df_daily']
 
         # 汎用データの場合は最大日付を終了日として使用
         if work_data['type'] == 'daily' and df_work_daily is not None and len(df_work_daily) > 0:
@@ -602,6 +612,10 @@ def update():
         # ============================================================
         # PT_DATA組み立て
         # ============================================================
+        # 大きなDataFrameを解放してからPT_DATA組み立て
+        del df_work, df_work_daily
+        gc.collect()
+
         today = date.today().strftime('%Y/%m/%d')
         last_date = biz_dates[-1].replace(f'{target_year}/', '')
         month_label = f'{target_year}年{target_month}月'
@@ -705,18 +719,30 @@ def _load_master(file_bytes):
 
 
 def _load_apo(file_bytes):
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True)
+    # 必要な列のみ読み込んでメモリ削減
+    NEEDED_COLS = ['アポイントID', 'スタッフ名', '社員番号', '登録案件名',
+                   '取得日', 'キャンセル受付日', '案件金額']
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb['Sheet1']
     rows = list(ws.iter_rows(values_only=True))
-    df = pd.DataFrame(rows[1:], columns=rows[0])
+    wb.close()  # 即座にcloseしてメモリ解放
+    header = rows[0]
+    # 必要列のインデックスを取得
+    col_idx = {c: i for i, c in enumerate(header) if c in NEEDED_COLS}
+    needed_idx = [col_idx.get(c) for c in NEEDED_COLS]
+    data = []
+    for row in rows[1:]:
+        data.append([row[i] if i is not None and i < len(row) else None for i in needed_idx])
+    del rows  # 元データを解放
+    df = pd.DataFrame(data, columns=NEEDED_COLS)
+    del data
     df = df[~df['スタッフ名'].isin(EXCLUDE_OPS)].copy()
     df['スタッフ名'] = df['スタッフ名'].replace('君塚綾子', '君塚綾子1104')
-    # 名称表記ゆれ正規化（スタッフ名ベースの突合精度向上のため）
     df['スタッフ名'] = df['スタッフ名'].replace('幸野有希子', '幸野有希子CRM')
-    # 社員番号列の正規化（D/B/A + 7桁数字）
     df['社員番号'] = df['社員番号'].astype(str).str.strip()
     df['cancel_date_str'] = df['キャンセル受付日'].astype(str).str.strip()
     df['sales'] = pd.to_numeric(df['案件金額'], errors='coerce').fillna(0)
+    gc.collect()
     return df
 
 
