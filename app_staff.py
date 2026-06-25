@@ -1489,34 +1489,29 @@ def register_staff_routes(app):
             for r in records:
                 r["target_month"] = r["appointment_date"][:7] + "-01" if r.get("appointment_date") else None
 
+            # アップロードデータに含まれる月の一覧
+            months_in_data = sorted(set(r["target_month"] for r in records if r.get("target_month")))
+
             # まずupsertで全件保存（既存は上書き、新規は追加）
             supabase_staff.table("appointments").upsert(records, on_conflict="appointment_id").execute()
 
-            # 次に「アップロードデータに含まれる月×スタッフの組み合わせ」において
-            # アポリストに存在しないIDを削除（余分なレコードを除去）
+            # アポリストに存在しないIDを一括削除
+            # 対象月に存在する全IDをDBから1回で取得
             uploaded_ids = set(r["appointment_id"] for r in records if r.get("appointment_id"))
-            months_in_data = set(r["target_month"] for r in records if r.get("target_month"))
-            staff_ids_in_data = set(r["staff_id"] for r in records if r.get("staff_id"))
-
             for month in months_in_data:
-                for staff_id in staff_ids_in_data:
-                    # DBにある当該月×スタッフのIDを取得
-                    existing_res = supabase_staff.table("appointments")\
-                        .select("appointment_id")\
-                        .eq("target_month", month)\
-                        .eq("staff_id", staff_id)\
+                existing_res = supabase_staff.table("appointments")\
+                    .select("appointment_id")\
+                    .eq("target_month", month)\
+                    .execute()
+                existing_ids = set(r["appointment_id"] for r in existing_res.data)
+                ids_to_delete = existing_ids - uploaded_ids
+                if ids_to_delete:
+                    supabase_staff.table("appointments")\
+                        .delete()\
+                        .in_("appointment_id", list(ids_to_delete))\
                         .execute()
-                    existing_ids = set(r["appointment_id"] for r in existing_res.data)
 
-                    # アポリストにないIDを削除
-                    ids_to_delete = existing_ids - uploaded_ids
-                    if ids_to_delete:
-                        supabase_staff.table("appointments")\
-                            .delete()\
-                            .in_("appointment_id", list(ids_to_delete))\
-                            .execute()
-
-            return jsonify({"status": "ok", "count": len(records), "months": sorted(months_in_data)})
+            return jsonify({"status": "ok", "count": len(records), "months": months_in_data})
         except Exception as e:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
