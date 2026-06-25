@@ -1485,28 +1485,36 @@ def register_staff_routes(app):
             if not records:
                 return jsonify({"error": "データがありません"}), 400
 
-            # target_monthを設定し、月ごとにグループ化
+            # target_monthを設定
             for r in records:
                 r["target_month"] = r["appointment_date"][:7] + "-01" if r.get("appointment_date") else None
 
-            # アップロードデータに含まれる月の一覧を取得
-            months_in_data = set(r["target_month"] for r in records if r.get("target_month"))
+            # まずupsertで全件保存（既存は上書き、新規は追加）
+            supabase_staff.table("appointments").upsert(records, on_conflict="appointment_id").execute()
 
-            # スタッフIDの一覧も取得（スタッフ単位で削除することで他スタッフに影響しない）
+            # 次に「アップロードデータに含まれる月×スタッフの組み合わせ」において
+            # アポリストに存在しないIDを削除（余分なレコードを除去）
+            uploaded_ids = set(r["appointment_id"] for r in records if r.get("appointment_id"))
+            months_in_data = set(r["target_month"] for r in records if r.get("target_month"))
             staff_ids_in_data = set(r["staff_id"] for r in records if r.get("staff_id"))
 
-            # 対象月×対象スタッフの既存データを全削除してから再挿入
             for month in months_in_data:
                 for staff_id in staff_ids_in_data:
-                    supabase_staff.table("appointments")\
-                        .delete()\
+                    # DBにある当該月×スタッフのIDを取得
+                    existing_res = supabase_staff.table("appointments")\
+                        .select("appointment_id")\
                         .eq("target_month", month)\
                         .eq("staff_id", staff_id)\
                         .execute()
+                    existing_ids = set(r["appointment_id"] for r in existing_res.data)
 
-            # 全件挿入（upsertではなくinsertで重複なく入れる）
-            if records:
-                supabase_staff.table("appointments").insert(records).execute()
+                    # アポリストにないIDを削除
+                    ids_to_delete = existing_ids - uploaded_ids
+                    if ids_to_delete:
+                        supabase_staff.table("appointments")\
+                            .delete()\
+                            .in_("appointment_id", list(ids_to_delete))\
+                            .execute()
 
             return jsonify({"status": "ok", "count": len(records), "months": sorted(months_in_data)})
         except Exception as e:
